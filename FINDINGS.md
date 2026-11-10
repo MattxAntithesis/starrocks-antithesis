@@ -218,10 +218,12 @@ and identify which table and load type owned tablets 10034-10046.
 
 ---
 
-## Finding 3: a Stream Load label stops deduplicating after an FE restart, so a retry applies the data twice
+## Finding 3: a Stream Load label stops deduplicating once `label_keep_max_num` is exceeded, so a retry applies the data twice
 
-**Status: the strongest finding of this work.** Reproduced on StarRocks 4.1.7 with a clear
-causal chain in the log. Data duplication, no crash involved.
+**Status: the strongest finding of this work.** Observed once on StarRocks 4.1.7, with a
+complete causal chain in the log and the root cause established in the FE code. The
+standalone reproduction follows from that root cause and has **not yet been executed**.
+Data duplication, no crash involved.
 
 **Run:** `c7d09923c0006169e56a8e0b37ee9c3a-67-0` (4.1.7 RELEASE, 90 minutes). Failing
 properties, all three the same underlying event:
@@ -303,6 +305,8 @@ cause.
 Written up for StarRocks in [REPORT-label-dedup.md](REPORT-label-dedup.md), with a
 reproduction that needs no fault injection.
 
-**To reproduce:** load with a label, confirm it is rejected as already used, restart the
-FE, then retry the same label. The run above makes the three-rejections-then-acceptance
-pattern explicit.
+**To reproduce:** exceeding the cap is the prerequisite, not the restart. Load under a
+label, confirm the label is rejected as already used, push the retained transaction count
+past `label_keep_max_num`, then let the cleaner run (a restart is the practical way) and
+retry the same label. Full recipe, with the config values that make it quick, in
+[REPORT-label-dedup.md](REPORT-label-dedup.md#6-reproduction).

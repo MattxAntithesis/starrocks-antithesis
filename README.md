@@ -11,7 +11,7 @@ StarRocks itself is unmodified: the FE and BE run from the official
 ## What it found
 
 **[A Stream Load label stops deduplicating once `label_keep_max_num` is exceeded, so an ordinary client retry applies the load twice.](REPORT-label-dedup.md)**
-Reproduced on 4.1.7, root-caused, and reproducible without any fault injection.
+Observed on 4.1.7 and root-caused in the FE code, with a standalone reproduction that needs no fault injection.
 
 StarRocks documents the load label as the at-most-once mechanism and documents
 its retention as `label_keep_max_second` (3 days). The label index is also

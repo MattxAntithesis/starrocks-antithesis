@@ -180,6 +180,9 @@ Two consequences worth separating:
 
 Does not need Antithesis or any fault injection. Single FE, any table.
 
+To be straight about provenance: this recipe follows from the root cause in section 5. What
+we ran is the simulation in section 4; we have not yet executed these steps standalone.
+
 ```sql
 -- fe.conf, then start the FE:
 --   label_keep_max_num = 2

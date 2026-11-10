@@ -143,10 +143,11 @@ whether the shutdown ordering changed between 3.5.19 and 4.1.7. A 90-minute run 
 
 ---
 
-## Finding 2: all three BEs segfault in the load write path on 4.1.7
+## Finding 2: all three BEs segfault committing a multi-table Stream Load transaction on 4.1.7
 
-**Status:** reproduced once, on the current release, with no faults active. Not reproduced
-locally.
+**Status:** observed once, on the current release, with no faults active. The triggering
+operation is now identified by replaying the moment in Antithesis. Not reproduced outside
+the simulator. Mechanism still unproven.
 
 **Run:** `c7d09923c0006169e56a8e0b37ee9c3a-67-0` (StarRocks 4.1.7 RELEASE, build b81ff9c,
 90-minute run). Properties `No unexpected crashes: starrocks_be` (3 counterexamples) and
@@ -212,9 +213,65 @@ following ~40 minutes, so it is rare. Antithesis reaches it by modulating the si
 CPU's relative instruction speeds, which explores thread orderings that a loaded 2-core VM
 does not produce.
 
-**To take this further**, re-run the moment inside Antithesis rather than locally:
-`snouty runs exec c7d09923c0006169e56a8e0b37ee9c3a-67-0 -8215334601661802087 24.44 <script>`,
-and identify which table and load type owned tablets 10034-10046.
+### What the moment replay showed
+
+The moment was rewarmed with `snouty debug` and inspected with `snouty runs exec`. Four
+things came out of it that the crash stack alone did not give.
+
+**The operation is a multi-table Stream Load transaction.** Label `b1_txn_stream_load`,
+`txn_id: 4`, `transaction_type: multi`, writing the same five rows to `ev` and `ev2` under
+one transaction:
+
+```
+24.275  [fe]  StreamLoadTask.tryBegin()   channel_id 0 begin.  db: aw, tbl: ev,  txn_id: 4
+24.310  [fe]  StreamLoadTask.tryBegin()   channel_id 0 begin.  db: aw, tbl: ev2, txn_id: 4
+24.326  [fe]  StreamLoadTask.prepareChannel()   tbl: ev2, txn_id: 4
+24.327  [fe]  unprotectedFinishStreamLoadChannel()  label: b1_txn_stream_load channel id 0
+24.327  [fe]  StreamLoadTask.prepareChannel()   tbl: ev,  txn_id: 4
+24.362  [fe]  unprotectedFinishStreamLoadChannel()  label: b1_txn_stream_load channel id 0
+```
+
+**The tablets resolve to tables.** From the `LocalTabletsChannel ... open 4 delta writer`
+lines: load `01a1c38f-bfe1-...` is `ev` with tablets 10034, 10038, 10042, 10046; load
+`01a1c38f-c004-...` is `ev2` with 10054, 10058, 10062, 10066. Both tables are
+`(batch BIGINT, seq INT, k INT, val BIGINT)` — the two `INT` columns match the crashing
+`FixedLengthColumnBase<int>`.
+
+**Each BE crashes microseconds after its own tablets-channel commit, on a disjoint tablet
+set.** `LocalTabletsChannel::commit` is what calls `DeltaWriter::close()`, the top of the
+crashing stack:
+
+```
+24.43964063632302  [be3]  LocalTabletsChannel txn_id: 4 ... commit 2 tablets: 10046,10034
+24.43964063678868  [be3]  *** SIGSEGV (@0x0) ***
+24.44364722422324  [be2]  LocalTabletsChannel txn_id: 4 ... commit 1 tablets: 10038
+24.443647224456072 [be2]  *** Aborted ***
+24.443647573469207 [be1]  LocalTabletsChannel txn_id: 4 ... commit 1 tablets: 10042
+24.44792373664677  [be1]  *** SIGSEGV (@0x0) ***
+```
+
+Disjoint tablets per BE argue against one malformed row replicated three ways, and for the
+same code path entered concurrently on each node.
+
+**The crashing thread is a `delta_writer` thread.** At the moment, `/proc/20/task` holds
+352 threads; LWP 523 — the TID in the SIGSEGV line — is `delta_writer` in state `R`. The
+second `delta_writer` (836) and both `memtable_flush` threads were in state `S`. That is
+weak evidence either way: `AsyncDeltaWriter::_execute` runs as a brpc bthread, multiplexed
+over pthreads, so OS-level thread states do not show how many logical tasks were in the
+flush path.
+
+**How rare it is.** Over the run, `snouty runs search` counts 2,511 multi-table Stream Load
+transaction begins and 456,370 `LocalTabletsChannel` events, against exactly 3 events
+matching `rolling_append_selective` — all at the single moment above. Roughly one crash per
+2,500 executions of a path that otherwise works, which is consistent with a narrow race and
+explains why local hammering did not reach it.
+
+**Still unresolved:** whether two logical tasks were inside `finalize()` concurrently. The
+official BE image writes no logs to disk (`/opt/starrocks/be/log/` is empty; all diagnostics
+go to stdout), so there is nothing beyond the timeline to read. `core_pattern` pipes to
+Antithesis's own coredump handler with `ulimit -c unlimited`, so a core was likely captured;
+retrieving and opening it is the next step, and an instrumented BE build would make the
+concurrency directly visible.
 
 ---
 

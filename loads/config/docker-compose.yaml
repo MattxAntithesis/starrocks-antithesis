@@ -1,0 +1,55 @@
+# Antithesis "loads" workload: 1 StarRocks FE, 3 BEs (replication 3), and the driver.
+# Build from antithesis/loads/config with `docker compose build`.
+x-be: &be
+  platform: linux/amd64
+  image: starrocks-be-antithesis:latest
+  depends_on: [fe]
+
+services:
+  fe:
+    container_name: fe
+    hostname: fe
+    platform: linux/amd64
+    image: starrocks-fe-antithesis:latest
+    build:
+      context: ..
+      dockerfile: fe/Dockerfile
+      args:
+        # Set STARROCKS_VERSION to build against another release, e.g. to replay
+        # a known bug on a version that still has it.
+        STARROCKS_VERSION: ${STARROCKS_VERSION:-4.1.7}
+
+  be1:
+    <<: *be
+    container_name: be1
+    hostname: be1
+    # Only be1 builds the shared BE image (parallel builds of one tag collide).
+    build:
+      context: ..
+      dockerfile: be/Dockerfile
+      args:
+        STARROCKS_VERSION: ${STARROCKS_VERSION:-4.1.7}
+  be2:
+    <<: *be
+    container_name: be2
+    hostname: be2
+  be3:
+    <<: *be
+    container_name: be3
+    hostname: be3
+
+  driver:
+    container_name: driver
+    hostname: driver
+    platform: linux/amd64
+    image: starrocks-loads-driver:latest
+    build:
+      context: ..
+      dockerfile: driver/Dockerfile
+    environment:
+      # Multi-table Stream Load transactions need StarRocks 4.0+; turn this
+      # "off" when replaying a bug against an older release.
+      DRIVER_MULTI_TABLE_TXN: "on"
+      FE_HOST: fe
+      BE_HOSTS: be1,be2,be3
+      RUST_BACKTRACE: "1"

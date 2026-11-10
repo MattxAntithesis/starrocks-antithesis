@@ -1,0 +1,7 @@
+# Local-loop overrides: write SDK assertions to a file, and control the eventually.
+services:
+  driver:
+    environment:
+      ANTITHESIS_SDK_LOCAL_OUTPUT: /tmp/sdk.jsonl
+      DRIVER_EVENTUALLY: ${DRIVER_EVENTUALLY:-off}
+      DRIVER_EVENTUALLY_AFTER_SECS: ${DRIVER_EVENTUALLY_AFTER_SECS:-}

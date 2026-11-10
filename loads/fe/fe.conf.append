@@ -1,0 +1,9 @@
+
+# --- antithesis workload ---
+# Repair tablets sooner after a BE is lost, so faults lead to clone/repair work.
+tablet_sched_checker_interval_seconds = 5
+tablet_sched_repair_delay_factor_second = 10
+# The Antithesis container has less than the default 5GB free, and the FE refuses
+# to start below this threshold (MetaHelper#checkMetaDir). It is also bdb-je's own
+# FREE_DISK threshold, so lowering it keeps both aligned.
+bdbje_free_disk_size = 536870912

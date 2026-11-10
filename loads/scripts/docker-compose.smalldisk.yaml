@@ -1,0 +1,6 @@
+# Local check: give the FE meta dir a 2GB filesystem, below StarRocks' 5GB gate,
+# to confirm the patched bdb-je default lets the FE start.
+services:
+  fe:
+    tmpfs:
+      - /opt/starrocks/fe/meta:size=2g

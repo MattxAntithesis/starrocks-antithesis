@@ -2,61 +2,18 @@
 
 Bugs and suspicious behavior found by the workload in `loads/`. Each entry gives the run, the failing property, and the evidence.
 
-Three findings so far; the one ready to report is Finding 3, written up in [REPORT-label-dedup.md](REPORT-label-dedup.md).
+Findings 2 and 3 below both came from a single 90-minute run on StarRocks 4.1.7
+(`c7d09923c0006169e56a8e0b37ee9c3a-67-0`). Finding 3 is the one ready to report and is
+written up in [REPORT-label-dedup.md](REPORT-label-dedup.md). Finding 1 is from a replay
+of 3.5.19 and has not been shown on a current release.
 
-| Run | Budget | Result |
-| --- | --- | --- |
-| `70c96cbac8d3808fe2b468ec803d2d59-67-0` | 12 CH | incomplete: FE could not start (disk gate, see below) |
-| `090cb636f9fd1dfa09a2c3fecc18b3e6-67-0` | 12 CH | incomplete: same |
-| `ffca0491df15d681c0fdb754a29daecf-67-0` | 12 CH | incomplete: same; named volumes share the one filesystem |
-| `a1def8152144102b8b521a92cc35e1df-67-0` | 12 CH | completed, all properties passed — but almost no faults were injected (see below) |
-| `0d677e57ab0ea300d7379d12b02a7c8f-67-0` | 24 CH | cancelled: same workload flaw |
-| `2e7645164d1edd4b7b598a113a3afdef-67-0` | 12 CH | **completed under real faults, every correctness property passed, no counterexamples** |
-| `efb092fe2214cb5478ca9de2aca85bd3-67-0` | 14 CH | completed, no counterexamples, but only 1 eventually finished (see below) |
+**What a clean property does not show.** A passing property is only as strong as the
+states the run actually reached, and an early version of this workload ended its timelines
+before Antithesis had injected any faults — every property passed for the wrong reason.
+`loads/README.md` documents that failure mode and the fault-density check that catches it.
+Treat any green result here as conditional on that check.
 
-Run 7 raised `EVENTUALLY_P` 3x to get more post-fault checks and got **fewer**: one
-eventually completed, against five or six in run 6, and three post-fault assertions
-went unreached (`acknowledged batches survive once faults stop`, `only batches the
-workload wrote appear`, `a committed transaction becomes visible once faults stop`).
-Nothing failed with a counterexample. The likely cause is that an eventually which
-starts while the cluster is badly broken blocks in its recovery wait (up to 600 s of
-virtual time) and the run ends before it reaches its assertions, so firing them more
-often makes fewer of them finish. Firing them *more* is therefore the wrong lever;
-shortening the recovery wait, or only starting an eventually when the cluster is
-already serving, would be the thing to try. **Run 6 remains the strongest evidence so
-far.**
-
-Run 6 is the first run that fuzzed StarRocks under real faults. Sampled timelines ran
-109-131 s of virtual time and took 37-57 network clogs, 37-49 partitions, 3-4 node
-kills, plus pauses, CPU throttles and clock skips each. Every correctness property
-passed with no counterexample, including the new
-*a batch's rows hold the values the workload wrote* (60 examples), *a load is never
-applied twice* (69), *a kv read reflects every write acknowledged before it started*
-(102) and the post-fault durability checks (6 each).
-
-One property failed as **never reached**, not violated: *a committed transaction
-becomes visible once faults stop* fires only when an eventually finds a batch that was
-acknowledged `COMMITTED` with publish still pending. Only 5-6 eventuallys ran in the
-whole run, so that combination never came up.
-
-Run 4 was the first run that fuzzed StarRocks at all. Every correctness property passed with
-no counterexample, including under BE kills, partitions and pauses: loads stayed
-all-or-nothing (89 examples), labels stayed idempotent under retries (89), primary-key
-reads were never stale (91), rolled-back transactions never appeared (47), and after
-faults stopped the cluster always recovered (24) with acknowledged data intact (15 batch,
-24 kv). Antithesis's own health properties passed too, including `Software was
-instrumented` and `Setup finished within 10 minutes`.
-
-**Run 4's clean result is not evidence that StarRocks is correct.** Sampling three of
-its timelines showed each one fuzzed for only ~15 s of virtual time after setup, with
-zero kills, partitions, clogs or pauses injected (one timeline had 2 CPU throttles);
-`the FE sees a backend down` passed just 3 times out of 70 hits. The cause was a
-workload bug: the eventually rule fired within about a second of the workload starting,
-stopped faults and exited the driver, ending the timeline before Antithesis faulted
-anything. Run `0d677e57ab0ea300d7379d12b02a7c8f-67-0` (24 CH) carried the same flaw and
-was cancelled. The driver now gates the eventually behind a minimum workload age.
-
-Caveat on what that does **not** show: only the Java FE carries Antithesis coverage
+A second limit: only the Java FE carries Antithesis coverage
 instrumentation. The C++ BE runs from the official release image, so Antithesis gets no
 coverage feedback from the backend, where the storage and transaction logic lives. An
 instrumented BE build (needs a larger build host than this VM) is the single biggest

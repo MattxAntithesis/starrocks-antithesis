@@ -7,7 +7,7 @@ We found two bugs in StarRocks 4.1.7. Both turned up in one 90-minute Antithesis
 | # | What goes wrong | Impact | How solid |
 | --- | --- | --- | --- |
 | 1 | A retried load is saved twice | Silent duplicate data | Root cause found in the code |
-| 2 | All three storage servers crash at once | Storage outage | Seen once, cause unproven |
+| 2 | All three storage servers crash at once | Storage outage | Reproduced on demand outside Antithesis |
 
 ---
 
@@ -58,15 +58,36 @@ Full write-up for StarRocks, with code walk and reproduction steps:
 
 ---
 
-## Finding 2: all three storage servers crash at once during a normal load
+## Finding 2: adding a column during a multi-table load crashes every storage server
 
-**In one line:** all three BEs segfaulted within 70 ms of each other while saving one
-ordinary load, with no faults injected and no memory pressure.
+**In one line:** if a column is added to a table while a multi-table Stream Load
+transaction is loading into it, all three BEs segfault at once. That is a full outage of
+the storage layer, set off by two ordinary operations. No faults are needed.
 
-**What we saw.** At virtual second 24.4, while committing a multi-table Stream Load
-transaction (label `b1_txn_stream_load`, writing to `ev` and `ev2`), each BE crashed
-microseconds after committing its own tablets. They had the same stack and were working
-on different tablets:
+**Reproduced outside Antithesis.** On a plain Docker host with the official 4.1.7 images,
+the trigger crashed all three BEs in every fresh cluster we tried. The controls show it
+needs both parts together:
+
+| What we ran (each with a concurrent `ALTER TABLE ... ADD COLUMN`, unless noted) | Result |
+| --- | --- |
+| Multi-table Stream Load transaction, column added during the load | **All 3 BEs crash**, 3 of 3 clean clusters, on the 2nd attempt |
+| Same transaction, no column added | No crash, 160 attempts |
+| Single-table Stream Load transaction interface | No crash, 190 attempts |
+| Ordinary single-table Stream Load | No crash, 160 attempts |
+
+So the exposure is narrower than "any load": it takes the multi-table transaction
+(`transaction_type: multi`, new in 4.0) and a schema change on one of its tables at the
+same moment.
+
+**The sequence** (from the original Antithesis run, virtual seconds):
+
+```
+24.275  multi-table txn "b1_txn_stream_load" (txn 4) starts its load into ev
+24.284  ALTER TABLE ev ADD COLUMN pad1 INT  -> applied as fast schema evolution
+24.301  ev load starts sending data, built before the column existed
+24.326  commit
+24.44   be3, be1, be2: SIGSEGV, same stack, within 10 ms
+```
 
 ```
 SIGSEGV (@0x0)  FixedLengthColumnBase<int>::append_selective
@@ -76,18 +97,26 @@ SIGSEGV (@0x0)  FixedLengthColumnBase<int>::append_selective
                 AsyncDeltaWriter::_execute
 ```
 
-Failing properties: *No unexpected crashes: starrocks_be* (3) and *No unexpected container
-exits* for `be1`, `be2` and `be3` (exit code 139).
+The column added is an `INT`, and the crash is in the `int` column code. Our local
+reproduction follows the same order and dies with the same stack.
 
-**How rare.** One crash moment in about 2,500 runs of this path. A local stress test
-didn't reproduce it.
+**Likely cause, not proven.** The load's data was shaped for the old table, and the
+memtable now expects the new one. `Chunk::rolling_append_selective` walks the columns
+assuming both sides have the same number. The only guard is a `DCHECK`, which release
+builds compile out, so a missing column becomes a null pointer. This fits everything we
+saw, but we haven't traced it line by line in a debugger.
 
-**Best guess, unproven.** `Chunk::rolling_append_selective` frees each source column as
-it goes and has only a `DCHECK` (compiled out in release) against a second pass. A second
-`finalize()` on the same memtable would crash exactly here. We have not observed one, and
-a plain race wouldn't obviously hit all three replicas at the same instant.
+**Antithesis had the trigger from the start.** The column add is in the log of the
+original run (`c7d09923…`, moment `-8215334601661802087`). We missed it three days ago
+and found it today, when a local run of the same workload crashed the same way.
 
-**Next step:** pull the core dump from the run, or rerun with an instrumented BE.
+**Reproduce it:** [`repro/`](repro/). Build the images with
+`cd loads/config && docker compose build`, then run
+`MODE=multi ALTER_AT=during repro/run.sh 20`. It starts a fresh 1-FE, 3-BE cluster,
+repeats the transaction with a concurrent column add, and prints the BE crash stacks.
+
+**Not yet done:** reporting it to StarRocks (we found no matching GitHub issue), and
+checking older 4.x releases.
 
 ---
 
@@ -106,13 +135,15 @@ the whole cluster and steers toward rare situations. One of our assertions asked
 find "a retried load whose label was already used", and it focused its search on retries
 under faults.
 
-**2. A crash that would normally be closed as "cannot reproduce" can now be replayed on
-demand.** The storage crash happened once in about 2,500 attempts. Fifteen minutes of
-stress testing on a real machine didn't reproduce it. Antithesis runs the whole cluster
-deterministically, so that exact moment can be replayed identically, as often as needed.
-We rewarmed it and ran commands inside the crashed cluster to find the operation, the
-tables, the tablets on each node and the thread involved. None of that was in the crash
-report.
+**2. It found a crash that needs two operations to overlap, and kept the evidence.**
+The storage crash needs a column added in the fraction of a second while a multi-table load
+is in flight. An earlier round of ordinary stress testing (15 minutes, without schema
+changes) never hit it. Antithesis did, because its workload mixes every kind of operation
+concurrently and varies their timing. Because the run is deterministic, the exact moment can
+be replayed identically. We replayed it to identify the load, the tables and the thread,
+and the run's single ordered log also held the column add that turned out to be the
+trigger. With that, the bug went from "seen once" to a five-line reproduction anyone can
+run.
 
 **3. One exact story across every machine.** Normally you piece a cluster bug together
 from separate logs on separate machines, with clocks that disagree. Antithesis gives a
@@ -125,8 +156,8 @@ forward again, we can rewrite history and watch what changes:
 
 - Rerun the duplicate-data timeline from just before the FE kill without the kill. If the
   retry is then rejected, the restart is shown to be the trigger.
-- Rerun the crash from milliseconds before it, many times with small variations, to
-  measure how often it happens and whether it's timing or the data that sets it off.
+- Rerun the crash moment without the column add, to confirm inside the simulator what the
+  local reproduction already shows.
 
 These experiments haven't been run yet. We list them because they are the direct way to
 turn "observed once" into "proven", and no other testing method can do them.

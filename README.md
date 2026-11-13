@@ -11,7 +11,7 @@ Both bugs came from one 90-minute run against the official 4.1.7 release images.
 | | Bug | Impact | Status |
 | --- | --- | --- | --- |
 | 1 | **A retried load is saved twice** | Silent duplicate data | Root cause found in the code |
-| 2 | **All three storage servers crash at once** | Storage outage | Seen once, cause unproven |
+| 2 | **All three storage servers crash at once** | Storage outage | Reproduced on demand outside Antithesis |
 
 **1. A retried load is saved twice.** StarRocks promises that resending a load
 under the same label is safe: the duplicate is rejected, for up to 3 days. In
@@ -21,10 +21,11 @@ seconds. In our run, a retry that had been rejected three times was accepted
 after the FE restarted, and the data landed twice. There was no error and
 nothing in the logs. Full write-up for StarRocks: [REPORT-label-dedup.md](REPORT-label-dedup.md).
 
-**2. All three storage servers crash at once.** All three BEs segfaulted within
-70 ms of each other while committing an ordinary multi-table load, with no faults
-injected. It happened once in about 2,500 runs of that path, and we have not
-proven why.
+**2. All three storage servers crash at once.** Add a column to a table while a
+multi-table Stream Load transaction is loading into it, and all three BEs segfault.
+No faults are needed. We reproduced it outside Antithesis on every fresh cluster we
+tried; ordinary single-table loads with the same column add did not crash. Script:
+[`repro/`](repro/).
 
 Details, evidence and why these needed Antithesis: [FINDINGS.md](FINDINGS.md).
 
@@ -36,6 +37,7 @@ Details, evidence and why these needed Antithesis: [FINDINGS.md](FINDINGS.md).
 | [REPORT-label-dedup.md](REPORT-label-dedup.md) | Bug 1 written up for StarRocks engineers: causal chain, code walk, reproduction steps |
 | [BUG-HISTORY.md](BUG-HISTORY.md) | How we chose what to test: 338 past StarRocks bug fixes, ranked by how often they were backported |
 | [`loads/`](loads/README.md) | The test workload: deployment, driver, and every property it checks |
+| [`repro/`](repro/) | Standalone reproduction of bug 2: no Antithesis, no faults |
 
 ## The workload
 

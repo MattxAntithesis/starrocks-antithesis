@@ -100,11 +100,10 @@ SIGSEGV (@0x0)  FixedLengthColumnBase<int>::append_selective
 The column added is an `INT`, and the crash is in the `int` column code. Our local
 reproduction follows the same order and dies with the same stack.
 
-**Likely cause, not proven.** The load's data was shaped for the old table, and the
-memtable now expects the new one. `Chunk::rolling_append_selective` walks the columns
-assuming both sides have the same number. The only guard is a `DCHECK`, which release
-builds compile out, so a missing column becomes a null pointer. This fits everything we
-saw, but we haven't traced it line by line in a debugger.
+**Cause not yet known.** The crash report shows that one of the load's source columns
+is null when `Chunk::rolling_append_selective` reaches it during the memtable sort. Why
+it is null is still open. The column add is clearly the trigger, but we haven't traced
+the path from the schema change to the null column.
 
 **Antithesis had the trigger from the start.** The column add is in the log of the
 original run (`c7d09923…`, moment `-8215334601661802087`). We missed it three days ago
@@ -137,13 +136,11 @@ under faults.
 
 **2. It found a crash that needs two operations to overlap, and kept the evidence.**
 The storage crash needs a column added in the fraction of a second while a multi-table load
-is in flight. An earlier round of ordinary stress testing (15 minutes, without schema
-changes) never hit it. Antithesis did, because its workload mixes every kind of operation
+is in flight. An earlier 15-minute round of ordinary stress testing never hit it. Antithesis did, because its workload mixes every kind of operation
 concurrently and varies their timing. Because the run is deterministic, the exact moment can
 be replayed identically. We replayed it to identify the load, the tables and the thread,
 and the run's single ordered log also held the column add that turned out to be the
-trigger. With that, the bug went from "seen once" to a five-line reproduction anyone can
-run.
+trigger. With that, the bug went from "seen once" to a short script anyone can run.
 
 **3. One exact story across every machine.** Normally you piece a cluster bug together
 from separate logs on separate machines, with clocks that disagree. Antithesis gives a

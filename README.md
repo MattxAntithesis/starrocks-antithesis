@@ -1,57 +1,58 @@
 # StarRocks under deterministic simulation
 
-A [hegel](https://hegel.dev) workload that runs StarRocks in
-[Antithesis](https://antithesis.com) and checks its load, transaction and
-primary-key guarantees while the simulator kills nodes, partitions the network,
-pauses processes, skews clocks and varies CPU speed.
-
-StarRocks itself is unmodified: the FE and BE run from the official
-`starrocks/{fe,be}-ubuntu` release images.
+We ran unmodified StarRocks 4.1.7 in [Antithesis](https://antithesis.com) and
+checked its load and transaction guarantees while the simulator killed nodes,
+cut the network, paused processes, skewed clocks and varied CPU speed.
 
 ## What it found
 
-Both findings below came from a single 90-minute run on StarRocks 4.1.7.
+Both bugs came from one 90-minute run against the official 4.1.7 release images.
 
-**[A Stream Load label stops deduplicating once `label_keep_max_num` is exceeded, so an ordinary client retry applies the load twice.](REPORT-label-dedup.md)**
-Observed on 4.1.7 and root-caused in the FE code, with a standalone reproduction that needs no fault injection.
+| | Bug | Impact | Status |
+| --- | --- | --- | --- |
+| 1 | **A retried load is saved twice** | Silent duplicate data | Root cause found in the code |
+| 2 | **All three storage servers crash at once** | Storage outage | Seen once, cause unproven |
 
-StarRocks documents the load label as the at-most-once mechanism and documents
-its retention as `label_keep_max_second` (3 days). The label index is also
-capped by `label_keep_max_num` (1000 per database), which evicts regardless of
-age and is enforced in bursts — by the `LoadLabelCleaner` daemon every
-`label_clean_interval_second` (4 hours) and by every checkpoint. A restarted FE
-enforces it within seconds of becoming ready. In the run below a label that had
-been correctly rejected three times was accepted 147 seconds after its
-transaction committed, and a five-row load landed twice. No error, no crash,
-nothing above INFO in the log.
+**1. A retried load is saved twice.** StarRocks promises that resending a load
+under the same label is safe: the duplicate is rejected, for up to 3 days. In
+practice labels are also capped at 1,000 per database, and the cap ignores
+age. A restart (a crash, a failover or a rolling upgrade) enforces the cap within
+seconds. In our run, a retry that had been rejected three times was accepted
+after the FE restarted, and the data landed twice. There was no error and
+nothing in the logs. Full write-up for StarRocks: [REPORT-label-dedup.md](REPORT-label-dedup.md).
 
-The report has the full causal chain, the code walk and a standalone
-reproduction. The second finding is in [FINDINGS.md](FINDINGS.md): all three BEs
-segfault at once while committing a multi-table Stream Load transaction, about
-once in 2,500 executions of that path. Seen once; cause unproven.
+**2. All three storage servers crash at once.** All three BEs segfaulted within
+70 ms of each other while committing an ordinary multi-table load, with no faults
+injected. It happened once in about 2,500 runs of that path, and we have not
+proven why.
 
-[BUG-HISTORY.md](BUG-HISTORY.md) is the analysis that aimed the workload: 833
-merged `[BugFix]` PRs reduced to 338 distinct fixes, ranked by backport count,
-mapped to the states a test would have to reach to catch them.
+Details, evidence and why these needed Antithesis: [FINDINGS.md](FINDINGS.md).
+
+## What's in this repo
+
+| File | What it is |
+| --- | --- |
+| [FINDINGS.md](FINDINGS.md) | Both bugs, the evidence, and why ordinary testing missed them |
+| [REPORT-label-dedup.md](REPORT-label-dedup.md) | Bug 1 written up for StarRocks engineers: causal chain, code walk, reproduction steps |
+| [BUG-HISTORY.md](BUG-HISTORY.md) | How we chose what to test: 338 past StarRocks bug fixes, ranked by how often they were backported |
+| [`loads/`](loads/README.md) | The test workload: deployment, driver, and every property it checks |
 
 ## The workload
 
-[`loads/README.md`](loads/README.md) documents the deployment, every action the
-driver takes, and every property it checks. In short: `INSERT`, Stream Load via
-the FE and directly to a BE, the Stream Load transaction interface, SQL
-transactions, primary-key upserts, partial column updates in row and column
-mode, schema changes, retries under the same label, and reads — all concurrent,
-all checked against a model of what was sent.
+A [hegel](https://hegel.dev) driver runs loads concurrently and checks every read
+against a model of what it sent. It covers `INSERT`, Stream Load via the FE and
+directly to a BE, the Stream Load transaction interface, SQL transactions,
+primary-key upserts, partial column updates, schema changes and retries under
+the same label.
 
-Some properties are ones a client cannot check for itself. *Replicas of a
-tablet agree on the row count at the same version* compares replicas directly
-through `information_schema.be_tablets`, because every FE-routed read sees only
-one of them.
+It also checks something a normal client can't: that replicas of a tablet agree
+on their row count. It reads them directly through
+`information_schema.be_tablets`, because a normal query only ever sees one
+replica.
 
 ## Running it
 
-Locally, without Antithesis or fault injection — this is enough to exercise the
-workload and see the assertions:
+Locally, without fault injection (enough to exercise the workload and its assertions):
 
 ```bash
 loads/scripts/local-run.sh 300
@@ -63,15 +64,14 @@ In Antithesis (needs `snouty` and a tenant):
 loads/scripts/launch.sh 12 "StarRocks loads/transactions" 90m
 ```
 
-Change the StarRocks version in `loads/config/.env`, not in the shell.
+To change the StarRocks version, edit `loads/config/.env`.
 
 ## Caveats
 
-- Only the Java FE carries Antithesis coverage instrumentation. The C++ BE runs
-  from the stock release image, so the search gets no coverage feedback from the
-  storage engine and no thread pausing there. An instrumented BE build is the
-  single biggest improvement available to this workload.
-- The FE will not start in a container whose filesystem reports under 5 GB, so
-  `loads/fe/patch_je_free_disk.py` lowers bdb-je's `je.freeDisk` default in the
-  bundled jar. StarRocks `main` already makes this configurable via
-  `bdbje_free_disk_size`. It is FE-side only and unrelated to any finding.
+- **Only the FE was instrumented.** The C++ BE runs from the stock image, so
+  Antithesis gets no coverage feedback or thread pausing inside the storage
+  engine. An instrumented BE build would be the biggest single improvement.
+- **One FE patch, for startup only.** The FE won't start when the filesystem
+  reports under 5 GB, which Antithesis containers do. `loads/fe/patch_je_free_disk.py`
+  lowers bdb-je's `je.freeDisk` default; StarRocks `main` already exposes this as
+  `bdbje_free_disk_size`. It has nothing to do with either bug.

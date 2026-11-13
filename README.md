@@ -26,11 +26,9 @@ transaction committed, and a five-row load landed twice. No error, no crash,
 nothing above INFO in the log.
 
 The report has the full causal chain, the code walk and a standalone
-reproduction. Two further findings are in [FINDINGS.md](FINDINGS.md), both weaker and
-labelled as such. The stronger of the two: all three BEs segfault while
-committing a multi-table Stream Load transaction, about once in 2,500
-executions of that path, with the triggering operation identified by replaying
-the moment but the mechanism still unproven.
+reproduction. The second finding is in [FINDINGS.md](FINDINGS.md): all three BEs
+segfault at once while committing a multi-table Stream Load transaction, about
+once in 2,500 executions of that path. Seen once; cause unproven.
 
 [BUG-HISTORY.md](BUG-HISTORY.md) is the analysis that aimed the workload: 833
 merged `[BugFix]` PRs reduced to 338 distinct fixes, ranked by backport count,

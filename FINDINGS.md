@@ -91,6 +91,48 @@ a plain race wouldn't obviously hit all three replicas at the same instant.
 
 ---
 
+## Why these bugs needed Antithesis
+
+Both bugs are in code StarRocks already tests heavily. Here is why ordinary methods
+missed them, and what was different here.
+
+**1. The duplicate-data bug is invisible to normal testing.** No error, no crash and no
+warning in the logs. A unit test checks one function, and this needs four things to go
+wrong in order: a lost reply, a restart, more than 1,000 loads, and then a retry. An
+integration test doesn't inject the lost reply or the restart. Production monitoring
+watches for errors, and there are none. The only symptom is that the totals are too high.
+Antithesis got there because it injects real faults (kills, partitions, pauses) across
+the whole cluster and steers toward rare situations. One of our assertions asked it to
+find "a retried load whose label was already used", and it focused its search on retries
+under faults.
+
+**2. A crash that would normally be closed as "cannot reproduce" can now be replayed on
+demand.** The storage crash happened once in about 2,500 attempts. Fifteen minutes of
+stress testing on a real machine didn't reproduce it. Antithesis runs the whole cluster
+deterministically, so that exact moment can be replayed identically, as often as needed.
+We rewarmed it and ran commands inside the crashed cluster to find the operation, the
+tables, the tablets on each node and the thread involved. None of that was in the crash
+report.
+
+**3. One exact story across every machine.** Normally you piece a cluster bug together
+from separate logs on separate machines, with clocks that disagree. Antithesis gives a
+single timeline of the FE, all three BEs, the client and every injected fault, in exact
+order. That is how we could say the label was deleted 1 second after the restart and 147
+seconds after the load, and connect it straight to the line of code responsible.
+
+**What the replay makes possible next.** Because any moment can be reopened and run
+forward again, we can rewrite history and watch what changes:
+
+- Rerun the duplicate-data timeline from just before the FE kill without the kill. If the
+  retry is then rejected, the restart is shown to be the trigger.
+- Rerun the crash from milliseconds before it, many times with small variations, to
+  measure how often it happens and whether it's timing or the data that sets it off.
+
+These experiments haven't been run yet. We list them because they are the direct way to
+turn "observed once" into "proven", and no other testing method can do them.
+
+---
+
 ## Limits of this testing
 
 - **Only the FE was instrumented.** The C++ BE ran from the stock image, so Antithesis had

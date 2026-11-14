@@ -16,7 +16,9 @@ if [ -n "${STARROCKS_VERSION:-}" ]; then
   echo "refusing to launch: STARROCKS_VERSION is set in the shell; set it in config/.env instead" >&2
   exit 1
 fi
-cd "$here/config"
+# CONFIG=config-3fe selects the multi-FE deployment.
+cfg="${CONFIG:-config}"
+cd "$here/$cfg"
 # A local run leaves its containers stopped; snouty validate refuses to start then.
 docker compose down -v --remove-orphans >/dev/null 2>&1 || true
 # SKIP_BUILD=1 launches the images already in the local store. Only use it when
@@ -29,16 +31,17 @@ if [ "${SKIP_BUILD:-0}" = "1" ]; then
 else
   docker compose build
 fi
-snouty validate "$here/config" --timeout 10m
+snouty validate "$here/$cfg" --timeout 10m
 plugin_version="0.0.9"
 SNOUTY_UNSTABLE_FEATURES=teams snouty launch \
   --launcher basic_test \
-  --config "$here/config" \
+  --config "$here/$cfg" \
   --test-name "starrocks-loads" \
   --description "$desc" \
   $( [ -n "$dur" ] && echo "--duration $dur" || echo "--max-compute-hours $hours" ) \
   --fault-tolerance high_availability \
   --fault-exclusions '^driver$' \
   --param attrs.workload=starrocks-loads \
+  --param attrs.deployment="$cfg" \
   --param attrs.starrocks_version=4.1.7 \
   --param attrs.plugin_version="$plugin_version"

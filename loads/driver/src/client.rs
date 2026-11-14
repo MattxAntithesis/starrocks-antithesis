@@ -4,32 +4,68 @@
 
 use mysql::prelude::Queryable;
 use mysql::{Conn, OptsBuilder};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 pub const DB: &str = "aw";
 
 #[derive(Clone)]
 pub struct Cluster {
-    pub fe: String,
+    /// Every FE. The driver talks to one at a time, like a client behind a
+    /// sticky load balancer, and moves to the next when that one stops
+    /// answering. It never rotates for any other reason, so a read is
+    /// compared against writes sent through the same FE except right after a
+    /// switch, which the log marks ("switching FE").
+    pub fes: Vec<String>,
+    cur: Arc<AtomicUsize>,
     pub bes: Vec<String>,
+}
+
+fn host_list(var: &str, default: &str) -> Vec<String> {
+    std::env::var(var)
+        .unwrap_or_else(|_| default.into())
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 impl Cluster {
     pub fn from_env() -> Self {
-        let fe = std::env::var("FE_HOST").unwrap_or_else(|_| "fe".into());
-        let bes = std::env::var("BE_HOSTS")
-            .unwrap_or_else(|_| "be1,be2,be3".into())
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        Cluster { fe, bes }
+        // FE_HOSTS lists every FE, the first being the initial leader.
+        // FE_HOST (one FE) is still accepted for the single-FE deployment.
+        let fes = match std::env::var("FE_HOSTS") {
+            Ok(_) => host_list("FE_HOSTS", "fe"),
+            Err(_) => host_list("FE_HOST", "fe"),
+        };
+        Cluster { fes, cur: Arc::new(AtomicUsize::new(0)), bes: host_list("BE_HOSTS", "be1,be2,be3") }
     }
 
-    /// Opens a MySQL connection to the FE. `db` selects the workload database.
-    pub fn conn(&self, db: bool, timeout: Duration) -> Result<Conn, String> {
+    /// The FE the driver is currently talking to.
+    pub fn fe(&self) -> String {
+        self.fes[self.cur.load(Ordering::SeqCst) % self.fes.len()].clone()
+    }
+
+    /// Moves to the next FE if `host` is still the current one: it failed to
+    /// answer. Concurrent failures on the same FE move it only once.
+    pub fn fe_failed(&self, host: &str, why: &str) {
+        if self.fes.len() < 2 {
+            return;
+        }
+        let i = self.cur.load(Ordering::SeqCst);
+        if self.fes[i % self.fes.len()] == host
+            && self.cur.compare_exchange(i, i + 1, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+        {
+            let next = &self.fes[(i + 1) % self.fes.len()];
+            println!("[driver] switching FE {host} -> {next}: {}", trunc(why));
+        }
+    }
+
+    /// Opens a MySQL connection to `host`.
+    pub fn conn_to(&self, host: &str, db: bool, timeout: Duration) -> Result<Conn, String> {
         let mut o = OptsBuilder::new()
-            .ip_or_hostname(Some(self.fe.clone()))
+            .ip_or_hostname(Some(host.to_string()))
             .tcp_port(9030)
             .user(Some("root"))
             .prefer_socket(false)
@@ -39,7 +75,24 @@ impl Cluster {
         if db {
             o = o.db_name(Some(DB));
         }
-        Conn::new(o).map_err(|e| format!("connect: {e}"))
+        // A follower FE may serve reads from metadata up to
+        // meta_delay_toleration_second (300 s) old, by design, so checks that
+        // a read reflects acknowledged writes only hold through the leader.
+        // DRIVER_FORWARD_TO_LEADER=on makes every statement go there.
+        if std::env::var("DRIVER_FORWARD_TO_LEADER").as_deref() == Ok("on") {
+            o = o.init(vec!["SET forward_to_leader = true"]);
+        }
+        Conn::new(o).map_err(|e| format!("connect {host}: {e}"))
+    }
+
+    /// Opens a MySQL connection to the current FE. `db` selects the workload
+    /// database. A failed connect moves the driver to the next FE.
+    pub fn conn(&self, db: bool, timeout: Duration) -> Result<Conn, String> {
+        let h = self.fe();
+        self.conn_to(&h, db, timeout).map_err(|e| {
+            self.fe_failed(&h, &e);
+            e
+        })
     }
 }
 
@@ -112,6 +165,7 @@ pub fn classify_info(info: &str) -> Outcome {
 
 /// Runs one DML statement on its own connection and classifies the result.
 pub fn exec_dml(cl: &Cluster, sql: &str, timeout: Duration) -> Outcome {
+    let h = cl.fe();
     let mut c = match cl.conn(true, timeout) {
         Ok(c) => c,
         // Could not connect: nothing was sent.
@@ -119,7 +173,13 @@ pub fn exec_dml(cl: &Cluster, sql: &str, timeout: Duration) -> Outcome {
     };
     match c.query_drop(sql) {
         Ok(()) => classify_info(&c.info_str()),
-        Err(e) => classify_sql_err(&e),
+        Err(e) => {
+            // No answer from this FE (not a server error): try another next time.
+            if !matches!(e, mysql::Error::MySqlError(_)) {
+                cl.fe_failed(&h, &e.to_string());
+            }
+            classify_sql_err(&e)
+        }
     }
 }
 

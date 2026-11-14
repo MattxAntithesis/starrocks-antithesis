@@ -11,4 +11,8 @@ exec_with_init() {
   done
   exec "$@"
 }
+# BE_MODE=cn runs the same binary as a compute node (shared-data deployment).
+if [ "${BE_MODE:-be}" = cn ]; then
+  exec_with_init /opt/starrocks/be/bin/start_cn.sh --logconsole
+fi
 exec_with_init /opt/starrocks/be/bin/start_be.sh --logconsole

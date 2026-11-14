@@ -55,7 +55,11 @@ A [hegel](https://hegel.dev) driver runs loads concurrently and checks every rea
 against a model of what it sent. It covers `INSERT`, Stream Load via the FE and
 directly to a BE, the Stream Load transaction interface, SQL transactions,
 primary-key upserts, partial column updates, schema changes and retries under
-the same label.
+the same label. It also covers partitions being overwritten and truncated under
+load, table rewrites (`OPTIMIZE`, sort-key changes, compaction) during loads, an
+async materialized view, and the query-cache and short-circuit read paths. It runs
+on three deployments: a single FE, three FEs with leader failover, and shared-data
+mode on S3 storage.
 
 It also checks something a normal client can't: that replicas of a tablet agree
 on their row count. It reads them directly through

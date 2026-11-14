@@ -5,7 +5,8 @@ FROM starrocks/be-ubuntu:${STARROCKS_VERSION}
 USER root
 RUN apt-get update -y && apt-get install -y --no-install-recommends jq && rm -rf /var/lib/apt/lists/*
 COPY be/be.conf.append /tmp/be.conf.append
-RUN cat /tmp/be.conf.append >> /opt/starrocks/be/conf/be.conf && rm /tmp/be.conf.append
+RUN cat /tmp/be.conf.append >> /opt/starrocks/be/conf/be.conf && \
+    cat /tmp/be.conf.append >> /opt/starrocks/be/conf/cn.conf && rm /tmp/be.conf.append
 COPY be/entrypoint.sh /entrypoint.sh
 RUN chmod 755 /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]

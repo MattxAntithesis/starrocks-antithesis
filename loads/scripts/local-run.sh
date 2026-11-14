@@ -9,7 +9,9 @@ secs="${1:-300}"
 ev="${2:-}"
 out="$here/runs/$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$out"
-cd "$here/config"
+# CONFIG=config-3fe selects the multi-FE deployment.
+cfg="${CONFIG:-config}"
+cd "$here/$cfg"
 export COMPOSE_FILE="docker-compose.yaml:../scripts/docker-compose.local.yaml"
 if [ -n "$ev" ]; then export DRIVER_EVENTUALLY=on DRIVER_EVENTUALLY_AFTER_SECS="$ev"; fi
 docker compose down -v --remove-orphans >/dev/null 2>&1 || true
@@ -25,7 +27,7 @@ while [ "$(date +%s)" -lt "$end" ]; do
   sleep 5
 done
 docker compose cp driver:/tmp/sdk.jsonl "$out/sdk.jsonl" || true
-for s in fe be1 be2 be3 driver; do docker compose logs --no-color "$s" > "$out/$s.log" 2>&1 || true; done
+for s in $(docker compose config --services); do docker compose logs --no-color "$s" > "$out/$s.log" 2>&1 || true; done
 docker compose ps -a > "$out/ps.txt"
 docker compose stop -t 60
 echo "assertions that would fail in a run:"

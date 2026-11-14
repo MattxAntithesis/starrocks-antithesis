@@ -1,0 +1,78 @@
+# Antithesis "loads" workload, multi-FE variant: 3 StarRocks FEs (fe1 starts as
+# leader, fe2/fe3 join as followers, so the cluster survives losing any one FE
+# and fails over to a new leader), 3 BEs (replication 3), and the driver.
+# Build from antithesis/loads/config-3fe with `docker compose build`.
+x-fe: &fe
+  platform: linux/amd64
+  image: starrocks-fe-antithesis:latest
+  environment: &fe-env
+    # Three FEs and three BEs share one Antithesis machine.
+    FE_XMX: 1024m
+x-be: &be
+  platform: linux/amd64
+  image: starrocks-be-antithesis:latest
+  depends_on: [fe1]
+
+services:
+  fe1:
+    <<: *fe
+    container_name: fe1
+    hostname: fe1
+    # Only fe1 builds the shared FE image (parallel builds of one tag collide).
+    build:
+      context: ..
+      dockerfile: fe/Dockerfile
+      args:
+        STARROCKS_VERSION: ${STARROCKS_VERSION:-4.1.7}
+  fe2:
+    <<: *fe
+    container_name: fe2
+    hostname: fe2
+    depends_on: [fe1]
+    environment:
+      <<: *fe-env
+      FE_HELPER: fe1:9010
+  fe3:
+    <<: *fe
+    container_name: fe3
+    hostname: fe3
+    depends_on: [fe1]
+    environment:
+      <<: *fe-env
+      FE_HELPER: fe1:9010
+
+  be1:
+    <<: *be
+    container_name: be1
+    hostname: be1
+    # Only be1 builds the shared BE image.
+    build:
+      context: ..
+      dockerfile: be/Dockerfile
+      args:
+        STARROCKS_VERSION: ${STARROCKS_VERSION:-4.1.7}
+  be2:
+    <<: *be
+    container_name: be2
+    hostname: be2
+  be3:
+    <<: *be
+    container_name: be3
+    hostname: be3
+
+  driver:
+    container_name: driver
+    hostname: driver
+    platform: linux/amd64
+    image: starrocks-loads-driver:latest
+    build:
+      context: ..
+      dockerfile: driver/Dockerfile
+    environment:
+      DRIVER_MULTI_TABLE_TXN: "on"
+      # The first FE is the initial leader; the driver adds the others as followers.
+      FE_HOSTS: fe1,fe2,fe3
+      # Followers may serve reads from stale metadata by design; read through the leader.
+      DRIVER_FORWARD_TO_LEADER: "on"
+      BE_HOSTS: be1,be2,be3
+      RUST_BACKTRACE: "1"

@@ -1,0 +1,67 @@
+# Antithesis "loads" workload, shared-data variant: 1 FE in shared_data run
+# mode, 3 compute nodes (the BE image started as CN), an S3-compatible object
+# store (SeaweedFS), and the driver. Tables live in object storage.
+# Build from antithesis/loads/config-shared with `docker compose build`.
+x-cn: &cn
+  platform: linux/amd64
+  image: starrocks-be-antithesis:latest
+  depends_on: [fe]
+  environment:
+    BE_MODE: cn
+
+services:
+  s3:
+    container_name: s3
+    hostname: s3
+    platform: linux/amd64
+    image: starrocks-s3-antithesis:latest
+    build:
+      context: ..
+      dockerfile: s3/Dockerfile
+
+  fe:
+    container_name: fe
+    hostname: fe
+    platform: linux/amd64
+    image: starrocks-fe-antithesis:latest
+    depends_on: [s3]
+    environment:
+      FE_RUN_MODE: shared_data
+    build:
+      context: ..
+      dockerfile: fe/Dockerfile
+      args:
+        STARROCKS_VERSION: ${STARROCKS_VERSION:-4.1.7}
+
+  cn1:
+    <<: *cn
+    container_name: cn1
+    hostname: cn1
+    build:
+      context: ..
+      dockerfile: be/Dockerfile
+      args:
+        STARROCKS_VERSION: ${STARROCKS_VERSION:-4.1.7}
+  cn2:
+    <<: *cn
+    container_name: cn2
+    hostname: cn2
+  cn3:
+    <<: *cn
+    container_name: cn3
+    hostname: cn3
+
+  driver:
+    container_name: driver
+    hostname: driver
+    platform: linux/amd64
+    image: starrocks-loads-driver:latest
+    build:
+      context: ..
+      dockerfile: driver/Dockerfile
+    environment:
+      DRIVER_MULTI_TABLE_TXN: "on"
+      DRIVER_SHARED_DATA: "on"
+      FE_HOST: fe
+      BE_HOSTS: cn1,cn2,cn3
+      RUST_BACKTRACE: "1"

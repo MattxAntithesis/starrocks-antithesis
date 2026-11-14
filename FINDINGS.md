@@ -244,23 +244,26 @@ concurrently and varies their timing. Because the run is deterministic, the exac
 be replayed identically. We replayed it to identify the load, the tables and the thread,
 and the run's single ordered log also held the column add that turned out to be the
 trigger. With that, the bug went from "seen once" to a short script anyone can run.
+StarRocks' own testing also found this crash and fixed it after 4.1.7 shipped. Antithesis
+found it independently, from the released images, with no knowledge of that fix.
 
-**3. One exact story across every machine.** Normally you piece a cluster bug together
+**3. It caught a wrong answer that raises no error.** The half-applied transaction in
+Finding 3 shows up as one query, among thousands, returning numbers that don't add up. There
+is no error, no log line and no crash. The workload checks every read against what it wrote,
+including reads that compare two tables in one statement, and that is what flagged it. The
+run's single ordered log then showed the query starting 2 ms before the transaction became
+visible, which pointed straight at the planner.
+
+**4. One exact story across every machine.** Normally you piece a cluster bug together
 from separate logs on separate machines, with clocks that disagree. Antithesis gives a
 single timeline of the FE, all three BEs, the client and every injected fault, in exact
 order. That is how we could say the label was deleted 1 second after the restart and 147
 seconds after the load, and connect it straight to the line of code responsible.
 
-**What the replay makes possible next.** Because any moment can be reopened and run
-forward again, we can rewrite history and watch what changes:
-
-- Rerun the duplicate-data timeline from just before the FE kill without the kill. If the
-  retry is then rejected, the restart is shown to be the trigger.
-- Rerun the crash moment without the column add, to confirm inside the simulator what the
-  local reproduction already shows.
-
-These experiments haven't been run yet. We list them because they are the direct way to
-turn "observed once" into "proven", and no other testing method can do them.
+**Replaying a moment with changes.** Any moment of a run can be reopened and run forward
+differently, for example without a fault or without a concurrent operation. That is the tool
+for bugs that won't reproduce outside the simulator. All three here did reproduce outside it,
+so the standalone scripts in [`repro/`](repro/) are the evidence.
 
 ---
 

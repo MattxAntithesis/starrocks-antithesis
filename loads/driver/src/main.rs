@@ -13,6 +13,7 @@
 mod client;
 mod inspect;
 mod model;
+mod part;
 
 use antithesis_sdk::prelude::*;
 use antithesis_sdk::{assert_always, assert_reachable, assert_sometimes};
@@ -82,9 +83,20 @@ pub struct Inner {
     /// When `/workload-active` appeared, so the eventually can wait for faults.
     workload_start: Instant,
     last_observe: Mutex<Option<Instant>>,
+    /// The FE leader at the first observation, and whether a later one differed.
+    first_leader: Mutex<Option<String>>,
+    leader_changed: std::sync::atomic::AtomicBool,
     last_inspect: Mutex<Option<Instant>>,
     /// When a schema change was last started, to pace them.
     last_alter: Mutex<Option<Instant>>,
+    /// Multi-table Stream Load transactions hold this shared; schema changes on
+    /// ev/ev2 hold it exclusively. A column add during a multi-table load
+    /// crashes every BE (FINDINGS.md, Finding 2); keeping them apart stops that
+    /// known bug from ending timelines before anything new can be found.
+    txn_alter_gate: RwLock<()>,
+    last_heavy: Mutex<Option<Instant>>,
+    pt: Mutex<part::PartState>,
+    next_tag: AtomicI64,
     /// Columns this workload added to `ev`/`ev2`, so it can drop them again.
     added_columns: Mutex<HashMap<&'static str, Vec<String>>>,
     next_alter: AtomicI64,
@@ -123,10 +135,17 @@ fn sql_ok(cl: &Cluster, db: bool, sql: &str) -> Result<(), String> {
     c.query_drop(sql).map_err(|e| e.to_string())
 }
 
-/// Rows of `SHOW BACKENDS` as (host, alive).
+/// DRIVER_SHARED_DATA=on: the FE runs in shared_data mode, the storage nodes
+/// are compute nodes, and tables live in an S3 storage volume.
+fn shared_data() -> bool {
+    std::env::var("DRIVER_SHARED_DATA").as_deref() == Ok("on")
+}
+
+/// Rows of `SHOW BACKENDS` (or `SHOW COMPUTE NODES`) as (host, alive).
 fn backends(cl: &Cluster) -> Result<Vec<(String, bool)>, String> {
     let mut c = cl.conn(false, READ_TIMEOUT)?;
-    let res: Vec<mysql::Row> = c.query("SHOW BACKENDS").map_err(|e| e.to_string())?;
+    let show = if shared_data() { "SHOW COMPUTE NODES" } else { "SHOW BACKENDS" };
+    let res: Vec<mysql::Row> = c.query(show).map_err(|e| e.to_string())?;
     let mut out = vec![];
     for row in res {
         let cols = row.columns();
@@ -139,6 +158,39 @@ fn backends(cl: &Cluster) -> Result<Vec<(String, bool)>, String> {
         out.push((host, alive.eq_ignore_ascii_case("true")));
     }
     Ok(out)
+}
+
+/// Rows of `SHOW FRONTENDS` as (host, alive, is_leader), as the current FE sees them.
+fn frontends(cl: &Cluster) -> Result<Vec<(String, bool, bool)>, String> {
+    let mut c = cl.conn(false, READ_TIMEOUT)?;
+    let res: Vec<mysql::Row> = c.query("SHOW FRONTENDS").map_err(|e| e.to_string())?;
+    let mut out = vec![];
+    for row in res {
+        let cols = row.columns();
+        let get = |name: &str| -> String {
+            cols.iter()
+                .position(|c| c.name_str() == name)
+                .and_then(|i| row.get_opt::<String, _>(i))
+                .and_then(|r| r.ok())
+                .unwrap_or_default()
+        };
+        let host = get("IP");
+        let alive = get("Alive").eq_ignore_ascii_case("true");
+        // 3.x+ reports Role LEADER; older releases had IsMaster.
+        let leader = get("Role").eq_ignore_ascii_case("leader") || get("IsMaster").eq_ignore_ascii_case("true");
+        out.push((host, alive, leader));
+    }
+    Ok(out)
+}
+
+fn all_frontends_alive(cl: &Cluster) -> Result<(), String> {
+    let f = frontends(cl)?;
+    let alive = f.iter().filter(|(_, a, _)| *a).count();
+    if alive >= cl.fes.len() && f.iter().any(|(_, _, l)| *l) {
+        Ok(())
+    } else {
+        Err(format!("{alive}/{} frontends alive: {f:?}", cl.fes.len()))
+    }
 }
 
 /// Retries `f` until it succeeds, printing why it is waiting when that changes.
@@ -180,6 +232,12 @@ const DDL: &[&str] = &[
     // Seed the partial-update-only keys. INSERT upserts by key, so a retry is
     // harmless. v=0 and s='' are generation 0, the column defaults.
     "INSERT INTO aw.pk (k, v, s, ver) VALUES (8,0,'',0),(9,0,'',0),(10,0,'',0),(11,0,'',0)",
+    part::DDL,
+    // An async materialized view over ev2, refreshed every minute (the 4.1.7 minimum) and on demand.
+    // Queries on ev2 may also be answered from it by transparent rewrite.
+    "CREATE MATERIALIZED VIEW IF NOT EXISTS aw.mv_ev2 DISTRIBUTED BY HASH(batch) BUCKETS 2 \
+     REFRESH ASYNC EVERY(INTERVAL 1 MINUTE) PROPERTIES(\"replication_num\"=\"3\") \
+     AS SELECT batch, count(*) AS c, sum(val) AS sv FROM aw.ev2 GROUP BY batch",
     "CREATE TABLE IF NOT EXISTS aw.probe (id BIGINT NOT NULL) \
      DUPLICATE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 1 PROPERTIES(\"replication_num\"=\"3\")",
 ];
@@ -213,9 +271,23 @@ fn all_backends_alive(cl: &Cluster) -> Result<(), String> {
 
 fn startup(cl: &Cluster) {
     wait_for("FE answers queries", || sql_ok(cl, false, "SELECT 1"));
+    // Followers wait in their entrypoint until the leader lists them, then join.
+    for fe in cl.fes.iter().skip(1) {
+        wait_for(&format!("add follower {fe}"), || {
+            match sql_ok(cl, false, &format!("ALTER SYSTEM ADD FOLLOWER '{fe}:9010'")) {
+                Ok(()) => Ok(()),
+                Err(e) if e.to_lowercase().contains("already exist") => Ok(()),
+                Err(e) => Err(e),
+            }
+        });
+    }
+    if cl.fes.len() > 1 {
+        wait_for("all frontends alive", || all_frontends_alive(cl));
+    }
     for be in &cl.bes {
         wait_for(&format!("add backend {be}"), || {
-            match sql_ok(cl, false, &format!("ALTER SYSTEM ADD BACKEND '{be}:9050'")) {
+            let kind = if shared_data() { "COMPUTE NODE" } else { "BACKEND" };
+            match sql_ok(cl, false, &format!("ALTER SYSTEM ADD {kind} '{be}:9050'")) {
                 Ok(()) => Ok(()),
                 Err(e) if e.to_lowercase().contains("already exist") => Ok(()),
                 Err(e) => Err(e),
@@ -223,6 +295,27 @@ fn startup(cl: &Cluster) {
         });
     }
     wait_for("all backends alive", || all_backends_alive(cl));
+    if shared_data() {
+        // SeaweedFS's S3 gateway runs without auth; the keys only satisfy the client.
+        wait_for("s3 bucket", || {
+            let out = std::process::Command::new("curl")
+                .args(["-s", "-o", "/dev/null", "-w", "%{http_code}", "-X", "PUT", "--max-time", "5", "http://s3:8333/starrocks"])
+                .output()
+                .map_err(|e| e.to_string())?;
+            let code = String::from_utf8_lossy(&out.stdout).to_string();
+            if code == "200" || code == "409" { Ok(()) } else { Err(format!("PUT bucket: http {code}")) }
+        });
+        for sql in [
+            "CREATE STORAGE VOLUME IF NOT EXISTS sv TYPE = S3 LOCATIONS = (\"s3://starrocks/data\") \
+             PROPERTIES (\"enabled\" = \"true\", \"aws.s3.endpoint\" = \"http://s3:8333\", \
+             \"aws.s3.region\" = \"us-east-1\", \"aws.s3.access_key\" = \"antithesis\", \
+             \"aws.s3.secret_key\" = \"antithesis\", \"aws.s3.enable_path_style_access\" = \"true\", \
+             \"aws.s3.use_instance_profile\" = \"false\", \"aws.s3.use_aws_sdk_default_behavior\" = \"false\")",
+            "SET sv AS DEFAULT STORAGE VOLUME",
+        ] {
+            wait_for(&format!("storage volume: {}", &sql[..sql.len().min(40)]), || sql_ok(cl, false, sql));
+        }
+    }
     for ddl in DDL {
         wait_for(&format!("ddl {}", &ddl[..ddl.len().min(40)]), || sql_ok(cl, false, ddl));
     }
@@ -262,8 +355,14 @@ impl Driver {
             multi_table_txn: std::env::var("DRIVER_MULTI_TABLE_TXN").as_deref() != Ok("off"),
             workload_start: t0,
             last_observe: Mutex::new(None),
+            first_leader: Mutex::new(None),
+            leader_changed: std::sync::atomic::AtomicBool::new(false),
             last_inspect: Mutex::new(None),
             last_alter: Mutex::new(None),
+            txn_alter_gate: RwLock::new(()),
+            last_heavy: Mutex::new(None),
+            pt: Mutex::new(part::PartState::default()),
+            next_tag: AtomicI64::new(1),
             added_columns: Mutex::new(HashMap::new()),
             next_alter: AtomicI64::new(1),
             pk_v: (0..NKEYS)
@@ -398,7 +497,7 @@ impl Driver {
             })
             .collect();
         let label = format!("kv_{}", self.next_value.fetch_add(1, Ordering::SeqCst));
-        let host = if via_be { format!("{be}:8040") } else { format!("{}:8030", self.cl.fe) };
+        let host = if via_be { format!("{be}:8040") } else { format!("{}:8030", self.cl.fe()) };
         let url = format!("http://{host}/api/{DB}/kv/_stream_load");
         self.kv_send(&writes);
         let r = self.http.send(
@@ -437,11 +536,22 @@ impl Driver {
             let list: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
             format!("SELECT k, v FROM kv WHERE k IN ({})", list.join(","))
         };
+        // Point lookups on a primary-key table can take the short-circuit path,
+        // which skips the regular scan pipeline: same answer required.
+        let short = !full && tc.draw(gs::weighted_booleans(0.5));
         let start = Instant::now();
         let res: Result<Vec<(i32, i64)>, String> = self
             .cl
             .conn(true, READ_TIMEOUT)
-            .and_then(|mut c| c.query(&sql).map_err(|e| e.to_string()));
+            .and_then(|mut c| {
+                if short {
+                    c.query_drop("SET enable_short_circuit = true").map_err(|e| e.to_string())?;
+                }
+                c.query(&sql).map_err(|e| e.to_string())
+            });
+        if short {
+            self.count("kv_read:short_circuit");
+        }
         let end = Instant::now();
         let rows = match res {
             Ok(r) => r,
@@ -572,7 +682,7 @@ impl Driver {
         // A full upsert writes the row whole without naming `n`, so the row it
         // leaves behind carries a freshly assigned auto-increment value.
         self.pk_row_replaced(k, Instant::now());
-        let host = if via_be { format!("{be}:8040") } else { format!("{}:8030", self.cl.fe) };
+        let host = if via_be { format!("{be}:8040") } else { format!("{}:8030", self.cl.fe()) };
         let r = self.http.send(
             "PUT",
             &format!("http://{host}/api/{DB}/pk/_stream_load"),
@@ -621,7 +731,7 @@ impl Driver {
         // so it stays possible only for the ambiguity window.
         let untouched: Vec<&str> = ["v", "s"].into_iter().filter(|c| *c != which).collect();
         self.pk_send(k, &untouched, Some(0));
-        let host = if via_be { format!("{be}:8040") } else { format!("{}:8030", self.cl.fe) };
+        let host = if via_be { format!("{be}:8040") } else { format!("{}:8030", self.cl.fe()) };
         let mut hdr: Vec<(&str, String)> = vec![
             ("label", format!("pkp_{g}")),
             ("column_separator", ",".into()),
@@ -847,7 +957,7 @@ impl Driver {
             Method::StreamLoadFe | Method::StreamLoadBe => {
                 let host = match (&b.method, via_be) {
                     (Method::StreamLoadBe, Some(be)) => format!("{be}:8040"),
-                    _ => format!("{}:8030", self.cl.fe),
+                    _ => format!("{}:8030", self.cl.fe()),
                 };
                 let r = self.http.send(
                     "PUT",
@@ -915,6 +1025,12 @@ impl Driver {
         self.count(format!("retry:{}", o.kind()));
         assert_sometimes!(o == Outcome::LabelExists, "a retried load finds its label already used", &d);
         assert_sometimes!(o == Outcome::Visible, "a retried load is acknowledged visible", &d);
+        if self.leader_changed.load(Ordering::SeqCst) {
+            // The label index must survive a change of leader: the new leader
+            // rebuilds it from the journal, then runs the label cleaner.
+            assert_sometimes!(o == Outcome::LabelExists,
+                "a retried load finds its label already used after an FE leader change", &d);
+        }
         if o != Outcome::LabelExists {
             self.record_batch(id, &o);
         }
@@ -987,7 +1103,7 @@ impl Driver {
     fn txn_http(&self, op: &str, label: &str, extra: &[(&str, String)], be: &str) -> Result<client::HttpResp, String> {
         // begin/prepare/commit/rollback go to the FE, which redirects to a BE;
         // occasionally address the BE directly instead.
-        let host = if be.is_empty() { format!("{}:8030", self.cl.fe) } else { format!("{be}:8040") };
+        let host = if be.is_empty() { format!("{}:8030", self.cl.fe()) } else { format!("{be}:8040") };
         let mut h: Vec<(&str, String)> = vec![("label", label.to_string()), ("db", DB.to_string())];
         h.extend(extra.iter().cloned());
         self.http.send("POST", &format!("http://{host}/api/transaction/{op}"), &h, &[])
@@ -1002,6 +1118,7 @@ impl Driver {
 
     fn txn_stream_load(&self, b: &Batch, finish: &str) {
         let multi = b.tables.len() > 1;
+        let _gate = if multi { Some(self.txn_alter_gate.read().unwrap_or_else(|e| e.into_inner())) } else { None };
         let mut begin_hdr: Vec<(&str, String)> = vec![("table", b.tables[0].to_string())];
         if multi {
             begin_hdr.push(("transaction_type", "multi".into()));
@@ -1024,7 +1141,7 @@ impl Driver {
             }
             let r = self.http.send(
                 "PUT",
-                &format!("http://{}:8030/api/transaction/load", self.cl.fe),
+                &format!("http://{}:8030/api/transaction/load", self.cl.fe()),
                 &h,
                 &Self::batch_csv(b),
             );
@@ -1119,6 +1236,13 @@ impl Driver {
         let sql =
             format!("SELECT batch, count(*), sum(seq), sum(val) FROM {table} {filter} GROUP BY batch");
         let mut c = self.cl.conn(true, READ_TIMEOUT)?;
+        // Half the aggregate reads go through the query cache, which keeps
+        // per-tablet partial aggregates and merges in new versions
+        // incrementally: a separate read path that must return the same answer.
+        if self.next_value.load(Ordering::Relaxed) % 2 == 0 {
+            c.query_drop("SET enable_query_cache = true").map_err(|e| e.to_string())?;
+            self.count("read:query_cache");
+        }
         let rows: Vec<(i64, i64, i64, i64)> = c.query(&sql).map_err(|e| e.to_string())?;
         Ok(rows
             .into_iter()
@@ -1269,6 +1393,23 @@ impl Driver {
             let d = json!({"backends": format!("{b:?}")});
             assert_sometimes!(alive < self.cl.bes.len() as i64, "the FE sees a backend down", &d);
         }
+        if self.cl.fes.len() > 1 {
+            if let Ok(f) = frontends(&self.cl) {
+                let alive = f.iter().filter(|(_, a, _)| *a).count();
+                let leader = f.iter().find(|(_, _, l)| *l).map(|(h, _, _)| h.clone());
+                let d = json!({"frontends": format!("{f:?}"), "via": self.cl.fe()});
+                assert_sometimes!(alive < self.cl.fes.len(), "an FE is seen down", &d);
+                if let Some(l) = leader {
+                    let mut first = lock(&self.first_leader);
+                    let first = first.get_or_insert_with(|| l.clone());
+                    let changed = *first != l;
+                    if changed && !self.leader_changed.swap(true, Ordering::SeqCst) {
+                        log(format!("FE leader changed: {first} -> {l}"));
+                    }
+                    assert_sometimes!(changed, "the FE leader changes", &d);
+                }
+            }
+        }
         let unhealthy: Result<Option<i64>, String> = self.cl.conn(false, READ_TIMEOUT).and_then(|mut c| {
             let rows: Vec<mysql::Row> = c.query("SHOW PROC '/statistic'").map_err(|e| e.to_string())?;
             let mut total = None;
@@ -1401,11 +1542,13 @@ impl Driver {
             let n = self.next_alter.fetch_add(1, Ordering::SeqCst);
             format!("ALTER TABLE {table} ADD COLUMN pad{n} INT NULL DEFAULT \"0\"")
         };
+        let gate = self.txn_alter_gate.write().unwrap_or_else(|e| e.into_inner());
         let o = match exec_dml(&self.cl, &sql, WRITE_TIMEOUT) {
             // ALTER answers with a bare OK packet: no label, no status.
             Outcome::Unknown(m) if m.starts_with("ok without status") => Outcome::Visible,
             other => other,
         };
+        drop(gate);
         self.count(format!("alter:{}", o.kind()));
         let d = json!({
             "table": table, "sql": sql, "outcome": o.kind(), "msg": trunc(&o.msg()),
@@ -1564,6 +1707,39 @@ impl Driver {
             Err(e) => assert_always!(false, "the cluster serves reads and writes again once faults stop",
                 &json!({"phase": "final kv scan", "error": e})),
         }
+        self.mv_final();
+        for p in 0..part::PARTITIONS.len() {
+            if let Err(e) = self.pt_check(p, true) {
+                assert_always!(false, "the cluster serves reads and writes again once faults stop",
+                    &json!({"phase": "final pt scan", "part": p, "error": e}));
+            }
+        }
+        // Replicas lost or left behind while faults ran must be repaired.
+        let deadline = Instant::now() + Duration::from_secs(240);
+        let mut last_unhealthy: Option<i64> = None;
+        let repaired = loop {
+            let n: Option<i64> = self.cl.conn(false, READ_TIMEOUT).ok().and_then(|mut c| {
+                let rows: Vec<mysql::Row> = c.query("SHOW PROC '/statistic'").ok()?;
+                let mut total = 0;
+                for row in rows {
+                    let cols = row.columns();
+                    let i = cols.iter().position(|c| c.name_str() == "UnhealthyTabletNum")?;
+                    let v: Option<String> = row.get_opt(i).and_then(|r| r.ok());
+                    total = total.max(v.and_then(|s| s.parse::<i64>().ok()).unwrap_or(0));
+                }
+                Some(total)
+            });
+            last_unhealthy = n.or(last_unhealthy);
+            if n == Some(0) {
+                break true;
+            }
+            if Instant::now() > deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_secs(3));
+        };
+        assert_always!(repaired, "unhealthy tablets are repaired once faults stop",
+            &json!({"unhealthy": last_unhealthy, "waited_s": 240}));
         log(format!("eventually: checked {} batches", bs.len()));
         self.end_timeline();
     }
@@ -1571,6 +1747,208 @@ impl Driver {
     fn end_timeline(&self) -> ! {
         log("eventually: ending the timeline");
         std::process::exit(0);
+    }
+
+    // ----- pt: partitions under load, overwrite and truncate ------------------
+
+    fn pt_write(&self, tc: &TestCase) {
+        use part::{Kind, Op, PARTITIONS};
+        let p = tc.draw(gs::integers::<usize>().min_value(0).max_value(PARTITIONS.len() - 1));
+        let kind = tc.draw(gs::sampled_from(vec![Kind::Load, Kind::Load, Kind::Load, Kind::Overwrite, Kind::Truncate]));
+        let rows = if kind == Kind::Truncate { 0 } else { tc.draw(gs::integers::<i64>().min_value(1).max_value(6)) };
+        let tag = self.next_tag.fetch_add(1, Ordering::SeqCst);
+        let (pname, date) = PARTITIONS[p];
+        let values: Vec<String> = (1..=rows).map(|s| format!("('{date}',{tag},{s},{})", tag * 1000 + s)).collect();
+        let sql = match kind {
+            Kind::Load => format!("INSERT INTO pt WITH LABEL pt_{tag} VALUES {}", values.join(",")),
+            Kind::Overwrite => format!("INSERT OVERWRITE pt PARTITION({pname}) VALUES {}", values.join(",")),
+            Kind::Truncate => format!("TRUNCATE TABLE pt PARTITION({pname})"),
+        };
+        let racing_eraser = lock(&self.pt).ops.iter()
+            .any(|o| o.part == p && o.kind.erases() && o.acked.is_none() && !o.failed);
+        lock(&self.pt).add(Op { tag, part: p, kind, rows, sent: Instant::now(), acked: None, failed: false });
+        let o = match exec_dml(&self.cl, &sql, WRITE_TIMEOUT) {
+            // TRUNCATE (and some OVERWRITE replies) answer with a bare OK packet.
+            Outcome::Unknown(m) if m.starts_with("ok without status") && kind.erases() => Outcome::Visible,
+            other => other,
+        };
+        let acked = (o == Outcome::Visible).then(Instant::now);
+        lock(&self.pt).ack(tag, acked, matches!(o, Outcome::Failed(_)));
+        self.count(format!("pt_{}:{}", kind.name(), o.kind()));
+        if matches!(o, Outcome::Unknown(_) | Outcome::Failed(_)) {
+            log(format!("pt {} {pname} tag {tag}: {} {}", kind.name(), o.kind(), trunc(&o.msg())));
+        }
+        let d = json!({"part": pname, "tag": tag, "kind": kind.name(), "outcome": o.kind(), "msg": trunc(&o.msg())});
+        match kind {
+            Kind::Load => assert_sometimes!(o == Outcome::Visible, "pt: a partition load is acknowledged visible", &d),
+            Kind::Overwrite => assert_sometimes!(o == Outcome::Visible, "pt: an INSERT OVERWRITE of a partition succeeds", &d),
+            Kind::Truncate => assert_sometimes!(o == Outcome::Visible, "pt: a TRUNCATE of a partition succeeds", &d),
+        }
+        assert_sometimes!(racing_eraser && kind == Kind::Load && o == Outcome::Visible,
+            "pt: a load into a partition succeeds while an overwrite or truncate of it is in flight", &d);
+        assert_sometimes!(racing_eraser && kind == Kind::Overwrite,
+            "pt: two overwrites or truncates of one partition overlap", &d);
+    }
+
+    /// Reads one partition (or all of them in the final check) and checks it.
+    fn pt_check(&self, p: usize, final_check: bool) -> Result<(), String> {
+        let (pname, _) = part::PARTITIONS[p];
+        let start = Instant::now();
+        let mut c = self.cl.conn(true, READ_TIMEOUT)?;
+        let rows: Vec<(i64, i64)> = c
+            .query(format!("SELECT tag, count(*) FROM pt PARTITION({pname}) GROUP BY tag"))
+            .map_err(|e| e.to_string())?;
+        let end = Instant::now();
+        let seen: HashMap<i64, i64> = rows.into_iter().collect();
+        let (start, end) = if final_check { (end, end) } else { (start, end) };
+        let vs = lock(&self.pt).check(p, &seen, start, end);
+        let base = json!({"part": pname, "final": final_check, "tags_seen": seen.len()});
+        let pick = |name: &str| -> (bool, serde_json::Value) {
+            let hits: Vec<&serde_json::Value> = vs.iter().filter(|v| v.property == name).map(|v| &v.detail).collect();
+            (hits.is_empty(), json!({"read": base, "violations": hits.iter().take(10).collect::<Vec<_>>()}))
+        };
+        let (ok, d) = pick("pt: only rows the workload wrote appear");
+        assert_always!(ok, "pt: only rows the workload wrote appear", &d);
+        let (ok, d) = pick("pt: a row appears only in the partition it was written to");
+        assert_always!(ok, "pt: a row appears only in the partition it was written to", &d);
+        let (ok, d) = pick("pt: an operation is never applied twice");
+        assert_always!(ok, "pt: an operation is never applied twice", &d);
+        let (ok, d) = pick("pt: an operation is visible entirely or not at all");
+        assert_always!(ok, "pt: an operation is visible entirely or not at all", &d);
+        let (ok, d) = pick("pt: an overwrite or truncate removes everything acknowledged before it started");
+        assert_always!(ok, "pt: an overwrite or truncate removes everything acknowledged before it started", &d);
+        let (ok, d) = pick("pt: an acknowledged operation stays visible until erased");
+        assert_always!(ok, "pt: an acknowledged operation stays visible until erased", &d);
+        if !vs.is_empty() {
+            log(format!("pt check {pname} final={final_check}: {} violations: {}", vs.len(),
+                trunc(&vs.iter().map(|v| format!("{} {}", v.property, v.detail)).collect::<Vec<_>>().join("; "))));
+        }
+        Ok(())
+    }
+
+    fn pt_read(&self, tc: &TestCase) {
+        let p = tc.draw(gs::integers::<usize>().min_value(0).max_value(part::PARTITIONS.len() - 1));
+        let r = self.pt_check(p, false);
+        self.count(format!("pt_read:{}", if r.is_ok() { "ok" } else { "failed" }));
+    }
+
+    // ----- materialized view --------------------------------------------------
+
+    fn mv_rows(&self) -> Result<Vec<(i64, i64, i64)>, String> {
+        let mut c = self.cl.conn(true, READ_TIMEOUT)?;
+        c.query("SELECT batch, c, sv FROM mv_ev2").map_err(|e| e.to_string())
+    }
+
+    /// Every MV row must describe a whole batch: a refresh reads ev2 at one
+    /// version, and every batch is loaded by a single transaction.
+    fn check_mv_rows(&self, rows: &[(i64, i64, i64)], final_check: bool) {
+        let bs = lock(&self.batches).by_id.clone();
+        for (batch, c, sv) in rows {
+            let b = bs.get(batch).filter(|b| b.tables.contains(&"ev2"));
+            let d = json!({"batch": batch, "c": c, "sv": sv, "final": final_check,
+                "rows": b.map(|b| b.rows), "method": b.map(|b| b.method.name())});
+            assert_always!(b.is_some(), "mv: only batches the workload wrote appear", &d);
+            let Some(b) = b else { continue };
+            // Rows are numbered from 0 (batch_csv, batch_values).
+            let want_sv: i64 = (0..b.rows).map(|s| b.id * 1000 + s).sum();
+            assert_always!(*c == b.rows && *sv == want_sv, "mv: a row holds a whole batch, exactly once", &d);
+            assert_always!(!b.rolled_back, "mv: a rolled-back transaction never appears", &d);
+        }
+    }
+
+    fn mv_read(&self, tc: &TestCase) {
+        if tc.draw(gs::weighted_booleans(0.2)) {
+            let o = exec_dml(&self.cl, "REFRESH MATERIALIZED VIEW mv_ev2", WRITE_TIMEOUT);
+            self.count(format!("mv_refresh:{}", o.kind()));
+            return;
+        }
+        match self.mv_rows() {
+            Ok(rows) => {
+                self.count("mv_read:ok");
+                assert_sometimes!(!rows.is_empty(), "mv: a read of the materialized view returns rows", &json!({"n": rows.len()}));
+                self.check_mv_rows(&rows, false);
+            }
+            Err(e) => {
+                self.count("mv_read:failed");
+                tc.note(&format!("mv read failed: {e}"));
+            }
+        }
+    }
+
+    /// After faults stop: a synchronous refresh makes the MV equal its base.
+    fn mv_final(&self) {
+        let o = exec_dml(&self.cl, "REFRESH MATERIALIZED VIEW mv_ev2 WITH SYNC MODE", Duration::from_secs(120));
+        let refreshed = match &o {
+            Outcome::Failed(_) => false,
+            Outcome::Unknown(m) => m.starts_with("ok without status"),
+            _ => true,
+        };
+        log(format!("eventually: mv sync refresh: {} {}", o.kind(), trunc(&o.msg())));
+        assert_sometimes!(refreshed, "mv: a synchronous refresh succeeds once faults stop", &json!({"msg": trunc(&o.msg())}));
+        if !refreshed {
+            return;
+        }
+        let mv = self.mv_rows();
+        let base: Result<Vec<(i64, i64, i64)>, String> = self.cl.conn(true, READ_TIMEOUT).and_then(|mut c| {
+            // Read the base table itself, not a rewrite onto the MV.
+            c.query_drop("SET enable_materialized_view_rewrite = false").map_err(|e| e.to_string())?;
+            c.query("SELECT batch, count(*), sum(val) FROM ev2 GROUP BY batch").map_err(|e| e.to_string())
+        });
+        if let (Ok(mut mv), Ok(mut base)) = (mv, base) {
+            mv.sort();
+            base.sort();
+            let diff: Vec<String> = {
+                let a: HashMap<i64, (i64, i64)> = mv.iter().map(|(b, c, s)| (*b, (*c, *s))).collect();
+                let b: HashMap<i64, (i64, i64)> = base.iter().map(|(b, c, s)| (*b, (*c, *s))).collect();
+                a.keys().chain(b.keys()).filter(|k| a.get(k) != b.get(k)).take(20)
+                    .map(|k| format!("batch {k}: mv {:?} base {:?}", a.get(k), b.get(k))).collect()
+            };
+            assert_always!(diff.is_empty(), "mv: a synchronous refresh makes the view match its base table",
+                &json!({"mv_rows": mv.len(), "base_rows": base.len(), "diff": diff}));
+            self.check_mv_rows(&mv, true);
+        }
+    }
+
+    // ----- heavy schema changes, optimize and compaction ----------------------
+
+    /// Table rewrites that StarRocks runs as background jobs while loads keep
+    /// going: changing the bucket count (OPTIMIZE), the sort key, and manual
+    /// compaction. Concurrent loads during such jobs are where several of the
+    /// project's silent data-loss fixes live (#82114, #34928).
+    fn heavy_alter(&self, tc: &TestCase) {
+        {
+            let mut last = lock(&self.last_heavy);
+            if last.map_or(false, |t| t.elapsed() < Duration::from_secs(30)) {
+                return;
+            }
+            *last = Some(Instant::now());
+        }
+        let buckets = tc.draw(gs::integers::<i64>().min_value(2).max_value(6));
+        let choice = tc.draw(gs::integers::<usize>().min_value(0).max_value(7));
+        let (table, what, sql) = match choice {
+            0 => ("ev", "optimize", format!("ALTER TABLE ev DISTRIBUTED BY HASH(batch, seq) BUCKETS {buckets}")),
+            1 => ("ev", "sort_key", "ALTER TABLE ev ORDER BY (seq, batch)".to_string()),
+            2 => ("ev", "sort_key", "ALTER TABLE ev ORDER BY (batch, seq)".to_string()),
+            3 => ("kv", "sort_key", "ALTER TABLE kv ORDER BY (v)".to_string()),
+            4 => ("kv", "sort_key", "ALTER TABLE kv ORDER BY (k)".to_string()),
+            5 => ("pt", "optimize", format!("ALTER TABLE pt DISTRIBUTED BY HASH(tag) BUCKETS {buckets}")),
+            6 => ("pt", "compact", "ALTER TABLE pt COMPACT".to_string()),
+            _ => ("ev", "compact", "ALTER TABLE ev COMPACT".to_string()),
+        };
+        let gate = (table == "ev").then(|| self.txn_alter_gate.write().unwrap_or_else(|e| e.into_inner()));
+        let o = match exec_dml(&self.cl, &sql, WRITE_TIMEOUT) {
+            Outcome::Unknown(m) if m.starts_with("ok without status") => Outcome::Visible,
+            other => other,
+        };
+        drop(gate);
+        self.count(format!("heavy_{what}:{}", o.kind()));
+        log(format!("heavy alter `{sql}`: {} {}", o.kind(), trunc(&o.msg())));
+        let d = json!({"table": table, "sql": sql, "outcome": o.kind(), "msg": trunc(&o.msg())});
+        match what {
+            "optimize" => assert_sometimes!(o == Outcome::Visible, "an OPTIMIZE (bucket change) starts while loads run", &d),
+            "sort_key" => assert_sometimes!(o == Outcome::Visible, "a sort key change starts while loads run", &d),
+            _ => assert_sometimes!(o == Outcome::Visible, "a manual compaction is accepted while loads run", &d),
+        }
     }
 
     fn act<F: FnOnce()>(&self, f: F) {
@@ -1666,6 +2044,26 @@ impl Driver {
         self.act(|| self.inspect(&tc));
     }
 
+    #[rule(weight = 3.0)]
+    fn rule_pt_write(&self, tc: TestCase) {
+        self.act(|| self.pt_write(&tc));
+    }
+
+    #[rule(weight = 2.0)]
+    fn rule_pt_read(&self, tc: TestCase) {
+        self.act(|| self.pt_read(&tc));
+    }
+
+    #[rule(weight = 1.0)]
+    fn rule_mv_read(&self, tc: TestCase) {
+        self.act(|| self.mv_read(&tc));
+    }
+
+    #[rule(weight = 1.0)]
+    fn rule_heavy_alter(&self, tc: TestCase) {
+        self.act(|| self.heavy_alter(&tc));
+    }
+
     #[rule(weight = 1.0)]
     fn rule_schema_change(&self, tc: TestCase) {
         self.act(|| self.schema_change(&tc));
@@ -1686,7 +2084,7 @@ fn main(tc: TestCase) {
     antithesis_init();
     let cl = Cluster::from_env();
     startup(&cl);
-    antithesis_sdk::lifecycle::setup_complete(&json!({"fe": cl.fe, "bes": cl.bes}));
+    antithesis_sdk::lifecycle::setup_complete(&json!({"fes": cl.fes, "bes": cl.bes}));
     log("setup complete; waiting for /workload-active");
     while !std::path::Path::new("/workload-active").exists() {
         std::thread::sleep(Duration::from_millis(100));

@@ -180,8 +180,17 @@ Two consequences worth separating:
 
 Does not need Antithesis or any fault injection. Single FE, any table.
 
-To be straight about provenance: this recipe follows from the root cause in section 5. What
-we ran is the simulation in section 4; we have not yet executed these steps standalone.
+We have run this standalone on a plain 4.1.7 cluster: [`repro/label_dedup.sh`](repro/label_dedup.sh)
+(1 FE, 3 BEs, `label_keep_max_num = 2`, an FE restart as the trigger). Output:
+
+```
+1. load under label L:           Success                  rows: 5
+2. retry under label L:          Label Already Exists
+3. three more loads (M N O)                               rows: 20
+4. retry under L (no restart):   Label Already Exists
+5. restart FE -> FE log: "transaction list [2, 4] are expired, remove them"
+6. retry under L after restart:  Success                  rows: 25
+```
 
 ```sql
 -- fe.conf, then start the FE:

@@ -7,7 +7,7 @@ added partition, table-rebuild and multi-table read checks (`05d22732e178b35d79c
 
 | # | What goes wrong | Impact | How solid |
 | --- | --- | --- | --- |
-| 1 | A retried load is saved twice | Silent duplicate data | Root cause found in the code |
+| 1 | A retried load is saved twice | Silent duplicate data | Root cause found and reproduced outside Antithesis |
 | 2 | All three storage servers crash at once | Storage outage | Reproduced on demand outside Antithesis |
 | 3 | One query sees a transaction half-applied | Inconsistent query results | Root cause found and reproduced outside Antithesis |
 
@@ -52,8 +52,20 @@ transactions when the count exceeds `label_keep_max_num`, and `clearTransactionS
 removes their labels from `labelToTxnIds`, which is the only thing `beginTransaction`
 checks. Restart recovery itself is correct. The restart only triggers the cleaner.
 
-**Not yet done:** the standalone reproduction (no Antithesis needed) follows from the code
-but hasn't been run. Seen on single-FE, shared-nothing tables only.
+**Reproduced outside Antithesis.** [`repro/label_dedup.sh`](repro/label_dedup.sh) starts a plain
+4.1.7 cluster with `label_keep_max_num = 2` and replays the sequence. The retry is rejected until
+the FE restarts. After the restart it is accepted, and the same 5 rows are stored twice:
+
+```
+1. load under label L:           Success                  rows: 5
+2. retry under label L:          Label Already Exists
+3. three more loads (M N O)                               rows: 20
+4. retry under L (no restart):   Label Already Exists
+5. restart FE -> FE log: "transaction list [2, 4] are expired, remove them"
+6. retry under L after restart:  Success                  rows: 25
+```
+
+**Not yet done:** reporting it to StarRocks. Seen on single-FE, shared-nothing tables only.
 
 Full write-up for StarRocks, with code walk and reproduction steps:
 [REPORT-label-dedup.md](REPORT-label-dedup.md).

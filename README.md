@@ -10,7 +10,7 @@ All three bugs were found in the official 4.1.7 release images.
 
 | | Bug | Impact | Status |
 | --- | --- | --- | --- |
-| 1 | **A retried load is saved twice** | Silent duplicate data | Root cause found in the code |
+| 1 | **A retried load is saved twice** | Silent duplicate data | Root cause found and reproduced outside Antithesis |
 | 2 | **All three storage servers crash at once** | Storage outage | Reproduced on demand outside Antithesis |
 | 3 | **One query sees a transaction half-applied** | Inconsistent query results | Root cause found and reproduced outside Antithesis |
 
@@ -20,7 +20,8 @@ practice labels are also capped at 1,000 per database, and the cap ignores
 age. A restart (a crash, a failover or a rolling upgrade) enforces the cap within
 seconds. In our run, a retry that had been rejected three times was accepted
 after the FE restarted, and the data landed twice. There was no error and
-nothing in the logs. Full write-up for StarRocks: [REPORT-label-dedup.md](REPORT-label-dedup.md).
+nothing in the logs. Reproduced outside Antithesis ([`repro/label_dedup.sh`](repro/label_dedup.sh)).
+Full write-up for StarRocks: [REPORT-label-dedup.md](REPORT-label-dedup.md).
 
 **2. All three storage servers crash at once.** Add a column to a table while a
 multi-table Stream Load transaction is loading into it, and all three BEs segfault.
@@ -44,7 +45,7 @@ Details, evidence and why these needed Antithesis: [FINDINGS.md](FINDINGS.md).
 | [REPORT-label-dedup.md](REPORT-label-dedup.md) | Bug 1 written up for StarRocks engineers: causal chain, code walk, reproduction steps |
 | [BUG-HISTORY.md](BUG-HISTORY.md) | How we chose what to test: 338 past StarRocks bug fixes, ranked by how often they were backported |
 | [`loads/`](loads/README.md) | The test workload: deployment, driver, and every property it checks |
-| [`repro/`](repro/) | Standalone reproductions of bugs 2 and 3: no Antithesis, no faults |
+| [`repro/`](repro/) | Standalone reproductions of all three bugs: no Antithesis, no faults |
 
 ## The workload
 
@@ -83,4 +84,4 @@ To change the StarRocks version, edit `loads/config/.env`.
 - **One FE patch, for startup only.** The FE won't start when the filesystem
   reports under 5 GB, which Antithesis containers do. `loads/fe/patch_je_free_disk.py`
   lowers bdb-je's `je.freeDisk` default; StarRocks `main` already exposes this as
-  `bdbje_free_disk_size`. It has nothing to do with either bug.
+  `bdbje_free_disk_size`. It has nothing to do with any of the bugs.

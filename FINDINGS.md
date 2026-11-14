@@ -147,8 +147,8 @@ FILTER=1 REPL=1 repro/torn_read.sh 90 32 4
 ```
 
 In one 90-second run of this command, 5 of 2,205 reads were torn. In every torn read, the
-table planned first was one transaction behind. Swapping the subquery order flipped which
-table lagged.
+table planned first was one transaction behind. With the subquery order swapped, the one torn
+read we got lagged in the other table.
 
 **Cause (4.1.7 source, confirmed by instrumenting the running FE).**
 

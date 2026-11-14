@@ -8,7 +8,7 @@ added partition, table-rebuild and multi-table read checks (`05d22732e178b35d79c
 | # | What goes wrong | Impact | How solid |
 | --- | --- | --- | --- |
 | 1 | A retried load is saved twice | Silent duplicate data | Root cause found and reproduced outside Antithesis |
-| 2 | All three storage servers crash at once | Storage outage | Reproduced on demand outside Antithesis |
+| 2 | All three storage servers crash at once | Storage outage | Root cause found; already fixed upstream after 4.1.7 |
 | 3 | One query sees a transaction half-applied | Inconsistent query results | Root cause found and reproduced outside Antithesis |
 
 ---
@@ -114,22 +114,45 @@ SIGSEGV (@0x0)  FixedLengthColumnBase<int>::append_selective
 The column added is an `INT`, and the crash is in the `int` column code. Our local
 reproduction follows the same order and dies with the same stack.
 
-**Cause not yet known.** The crash report shows that one of the load's source columns
-is null when `Chunk::rolling_append_selective` reaches it during the memtable sort. Why
-it is null is still open. The column add is clearly the trigger, but we haven't traced
-the path from the schema change to the null column.
+**Cause: the FE plans the load against two versions of the table.** Confirmed by
+attaching gdb to a crashing BE and pausing the FE's planner with a Java debugger.
+Code references are to the 4.1.7 tag:
+
+1. A transaction Stream Load is planned with no table lock. `LoadPlanner.plan()` builds the
+   load's column slots from the schema as it is then (`destColumns = destTable.getFullSchema()`),
+   four columns.
+2. The column add lands next. Fast schema evolution changes the table's schema in place.
+3. The plan's sink then reads the schema again, under its own short lock, and sends the BEs
+   five columns and the new schema version, alongside slots for only four.
+4. The BE drops the column that has no slot (`OlapTableSchemaParam::init`, `tablet_info.cpp`)
+   but builds its memtable five columns wide. `MemTable::insert` fills only the four slotted
+   columns, so the new one stays empty.
+5. Sorting the memtable reads the empty column's data pointer, which is null. That is the
+   `SIGSEGV (@0x0)` on every replica, since all three get the same plan.
+
+Pausing the FE planner right after step 1 and adding the column crashes all three BEs on the
+first try. Pausing it before step 1, or adding nothing, does not. Plain and single-table
+transaction loads without channel headers are planned under the table lock instead, which is
+why they did not crash.
+
+**Already fixed upstream, after 4.1.7.** StarRocks found the same crash independently, in
+shared-data mode, and fixed it in
+[#82219](https://github.com/StarRocks/starrocks/pull/82219) (main), backported to the 4.1
+branch in [#82329](https://github.com/StarRocks/starrocks/pull/82329). Both merged on
+2026-11-03, after 4.1.7 was tagged on 2026-10-22. The fix plans the load under the table lock,
+and makes the BE reject a load whose slots don't match its schema. 4.1.7 is affected; the
+next 4.1 patch release should not be.
 
 **Antithesis had the trigger from the start.** The column add is in the log of the
-original run (`c7d09923…`, moment `-8215334601661802087`). We missed it three days ago
-and found it today, when a local run of the same workload crashed the same way.
+original run (`c7d09923…`, moment `-8215334601661802087`) on 2026-11-10. We noticed it on
+2026-11-13, when a local run of the same workload crashed the same way.
 
 **Reproduce it:** [`repro/`](repro/). Build the images with
 `cd loads/config && docker compose build`, then run
 `MODE=multi ALTER_AT=during repro/run.sh 20`. It starts a fresh 1-FE, 3-BE cluster,
 repeats the transaction with a concurrent column add, and prints the BE crash stacks.
 
-**Not yet done:** reporting it to StarRocks (we found no matching GitHub issue), and
-checking older 4.x releases.
+**Nothing to report:** the fix is already merged (above). Older 4.x releases were not checked.
 
 ---
 

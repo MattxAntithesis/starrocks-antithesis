@@ -11,7 +11,7 @@ All three bugs were found in the official 4.1.7 release images.
 | | Bug | Impact | Status |
 | --- | --- | --- | --- |
 | 1 | **A retried load is saved twice** | Silent duplicate data | Root cause found and reproduced outside Antithesis |
-| 2 | **All three storage servers crash at once** | Storage outage | Reproduced on demand outside Antithesis |
+| 2 | **All three storage servers crash at once** | Storage outage | Root cause found; already fixed upstream after 4.1.7 |
 | 3 | **One query sees a transaction half-applied** | Inconsistent query results | Root cause found and reproduced outside Antithesis |
 
 **1. A retried load is saved twice.** StarRocks promises that resending a load
@@ -26,8 +26,10 @@ Full write-up for StarRocks: [REPORT-label-dedup.md](REPORT-label-dedup.md).
 **2. All three storage servers crash at once.** Add a column to a table while a
 multi-table Stream Load transaction is loading into it, and all three BEs segfault.
 No faults are needed. We reproduced it outside Antithesis on every fresh cluster we
-tried; ordinary single-table loads with the same column add did not crash. Script:
-[`repro/`](repro/).
+tried. The FE plans the load against two versions of the table schema at once.
+StarRocks found and fixed the same crash independently after 4.1.7 was released
+([#82219](https://github.com/StarRocks/starrocks/pull/82219), backported to 4.1 in
+[#82329](https://github.com/StarRocks/starrocks/pull/82329)). Script: [`repro/`](repro/).
 
 **3. One query sees a transaction half-applied.** StarRocks promises that a
 transaction writing to several tables becomes visible all at once. A query reading

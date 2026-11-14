@@ -6,12 +6,13 @@ cut the network, paused processes, skewed clocks and varied CPU speed.
 
 ## What it found
 
-Both bugs came from one 90-minute run against the official 4.1.7 release images.
+All three bugs were found in the official 4.1.7 release images.
 
 | | Bug | Impact | Status |
 | --- | --- | --- | --- |
 | 1 | **A retried load is saved twice** | Silent duplicate data | Root cause found in the code |
 | 2 | **All three storage servers crash at once** | Storage outage | Reproduced on demand outside Antithesis |
+| 3 | **One query sees a transaction half-applied** | Inconsistent query results | Root cause found and reproduced outside Antithesis |
 
 **1. A retried load is saved twice.** StarRocks promises that resending a load
 under the same label is safe: the duplicate is rejected, for up to 3 days. In
@@ -27,17 +28,23 @@ No faults are needed. We reproduced it outside Antithesis on every fresh cluster
 tried; ordinary single-table loads with the same column add did not crash. Script:
 [`repro/`](repro/).
 
+**3. One query sees a transaction half-applied.** StarRocks promises that a
+transaction writing to several tables becomes visible all at once. A query reading
+two of those tables while the transaction commits can see it in one and not the
+other, because each table's version is picked separately, without a lock. About
+1 read in 440 under a steady write load. Script: [`repro/torn_read.sh`](repro/torn_read.sh).
+
 Details, evidence and why these needed Antithesis: [FINDINGS.md](FINDINGS.md).
 
 ## What's in this repo
 
 | File | What it is |
 | --- | --- |
-| [FINDINGS.md](FINDINGS.md) | Both bugs, the evidence, and why ordinary testing missed them |
+| [FINDINGS.md](FINDINGS.md) | All three bugs, the evidence, and why ordinary testing missed them |
 | [REPORT-label-dedup.md](REPORT-label-dedup.md) | Bug 1 written up for StarRocks engineers: causal chain, code walk, reproduction steps |
 | [BUG-HISTORY.md](BUG-HISTORY.md) | How we chose what to test: 338 past StarRocks bug fixes, ranked by how often they were backported |
 | [`loads/`](loads/README.md) | The test workload: deployment, driver, and every property it checks |
-| [`repro/`](repro/) | Standalone reproduction of bug 2: no Antithesis, no faults |
+| [`repro/`](repro/) | Standalone reproductions of bugs 2 and 3: no Antithesis, no faults |
 
 ## The workload
 

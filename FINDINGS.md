@@ -1,13 +1,15 @@
 # Findings: StarRocks 4.1.7
 
-We found two bugs in StarRocks 4.1.7. Both turned up in one 90-minute Antithesis run
-(`c7d09923c0006169e56a8e0b37ee9c3a-67-0`) against the official release images
-(`starrocks/{fe,be}-ubuntu:4.1.7`, build `b81ff9c`).
+We found three bugs in StarRocks 4.1.7, all against the official release images
+(`starrocks/{fe,be}-ubuntu:4.1.7`, build `b81ff9c`). Findings 1 and 2 came from one 90-minute
+Antithesis run (`c7d09923c0006169e56a8e0b37ee9c3a-67-0`). Finding 3 came from a later run that
+added partition, table-rebuild and multi-table read checks (`05d22732e178b35d79c3fab4f7bc4287-67-0`).
 
 | # | What goes wrong | Impact | How solid |
 | --- | --- | --- | --- |
 | 1 | A retried load is saved twice | Silent duplicate data | Root cause found in the code |
 | 2 | All three storage servers crash at once | Storage outage | Reproduced on demand outside Antithesis |
+| 3 | One query sees a transaction half-applied | Inconsistent query results | Root cause found and reproduced outside Antithesis |
 
 ---
 
@@ -119,9 +121,75 @@ checking older 4.x releases.
 
 ---
 
+## Finding 3: one query can see a committed transaction half-applied
+
+**In one line:** a query that reads two tables can see a multi-table transaction in one table
+but not the other. That happens when the transaction becomes visible while the query is
+being planned. Nothing is lost, but that query's answer matches no real state of the
+database.
+
+**Why it matters.** StarRocks documents multi-table transactions as atomic. SQL transactions
+are "applied or undone together" (`docs/en/loading/SQL_transaction.md`), and multi-table Stream
+Load data "becomes visible atomically — all or nothing"
+(`docs/en/loading/Flink_multi_table_transaction.md`). A report that joins or compares two tables
+can come out inconsistent for that one query: an order without its line items, or two ledgers
+that don't balance. Rerunning the query gives the right answer, so it looks like a glitch nobody
+can explain.
+
+**Reproduced outside Antithesis.** One client commits SQL transactions that insert the same rows
+into tables `a` and `b`. Others repeatedly run
+`SELECT (SELECT count(*) FROM a WHERE v > 0), (SELECT count(*) FROM b WHERE v > 0)`.
+On 4.1.7, with no faults and one replica, about 1 read in 440 returns different counts. The
+totals always match in the end.
+
+```
+FILTER=1 REPL=1 repro/torn_read.sh 90 32 4
+```
+
+In one 90-second run of this command, 5 of 2,205 reads were torn. In every torn read, the
+table planned first was one transaction behind. Swapping the subquery order flipped which
+table lagged.
+
+**Cause (4.1.7 source, confirmed by instrumenting the running FE).**
+
+1. *Commit is atomic.* `DatabaseTransactionMgr.finishTransaction` holds write locks on every
+   table in the transaction while it bumps each partition's visible version.
+2. *Reads take no snapshot of those versions.* Queries are planned lock-free.
+   `OlapTable.copyOnlyForQuery` copies the tables under a lock, then releases it, but
+   `Partition.shallowCopy` keeps pointing at the live `PhysicalPartition` objects.
+3. *Each table's version is read later, separately.* `OlapScanNode.addScanRangeLocations` reads
+   `physicalPartition.getVisibleVersion()` when the plan builder reaches that scan, with no lock
+   held. A commit landing between the scan for `a` and the scan for `b` gives `a` at version N
+   and `b` at N+1.
+4. *Nothing notices.* The post-planning check (`OptimisticVersion.validateTableUpdate`) looks
+   only at schema changes, not at data commits.
+
+A probe on the live FE caught one query in the act:
+
+```
+READV  query 3bc1  table=a  version=5
+FIN_BEGIN txn 4245 ; version a 5->6 ; version b 5->6 ; FIN_END
+READV  query 3bc1  table=b  version=6
+```
+
+The workaround one would try, `SET cbo_use_lock_db = true`, does not help this query shape. The
+planner builds its lock list before analysis, when subqueries in the SELECT list are still
+invisible to it, so it locks nothing. That collector gap is already reported upstream for
+another reason (issue #82969, PR #82970, both open). The missing version snapshot is not, as
+far as we found.
+
+**Also seen in Antithesis**, with a multi-table Stream Load transaction: the read began 2 ms
+before the transaction became visible and saw 3 rows in `ev` and none in `ev2`.
+
+**Not yet done:** reporting it to StarRocks, and testing shared-data mode. We also saw a single
+plain INSERT appear half-applied across two partitions of one table, once in about 8,500
+reads. The mechanism allows it, but one sighting is not enough to claim it.
+
+---
+
 ## Why these bugs needed Antithesis
 
-Both bugs are in code StarRocks already tests heavily. Here is why ordinary methods
+All three bugs are in code StarRocks already tests heavily. Here is why ordinary methods
 missed them, and what was different here.
 
 **1. The duplicate-data bug is invisible to normal testing.** No error, no crash and no

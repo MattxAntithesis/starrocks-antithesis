@@ -226,8 +226,16 @@ far as we found.
 **Also seen in Antithesis**, with a multi-table Stream Load transaction: the read began 2 ms
 before the transaction became visible and saw 3 rows in `ev` and none in `ev2`.
 
-**Not yet done:** reporting it to StarRocks, testing shared-data mode, and testing whether a
-materialized view refresh can store the half-applied state the way `INSERT ... SELECT` does.
+**Shared-data mode is affected too, and more often.** On a local shared-data cluster (S3
+storage, three compute nodes; `SHARED=1 FILTER=1 repro/torn_read.sh 180 16 4`), 47 of 4,544
+reads were torn, about 1 in 97, against about 1 in 440 on shared-nothing. Antithesis also hit it
+in a shared-data run (`6efc9d648a0c3c0bf66fc45cc9a085f7-67-6`): the query started 4 ms before
+the transaction became visible, and saw 0 rows in `ev` and 4 in `ev2`. We believe the higher
+rate comes from slower planning in shared-data, which widens the window, but we have not
+measured it.
+
+**Not yet done:** reporting it to StarRocks, and testing whether a materialized view refresh can
+store the half-applied state the way `INSERT ... SELECT` does.
 We also saw a single
 plain INSERT appear half-applied across two partitions of one table, once in about 8,500
 reads. The mechanism allows it, but one sighting is not enough to claim it.

@@ -8,11 +8,11 @@ cut the network, paused processes, skewed clocks and varied CPU speed.
 
 All three bugs were found in the official 4.1.7 release images.
 
-| | Bug | Impact | Status |
-| --- | --- | --- | --- |
-| 1 | **A retried load is saved twice** | Silent duplicate data | Root cause found and reproduced outside Antithesis |
-| 2 | **All three storage servers crash at once** | Storage outage | Root cause found; already fixed upstream after 4.1.7 |
-| 3 | **One query sees a transaction half-applied** | Inconsistent results, which can be stored | Root cause found and reproduced outside Antithesis |
+| | Bug | Impact | Status | Known upstream? |
+| --- | --- | --- | --- | --- |
+| 1 | **A retried load is saved twice** | Silent duplicate data | Root cause found and reproduced outside Antithesis | No report or fix found |
+| 2 | **All three storage servers crash at once** | Storage outage | Root cause found and reproduced outside Antithesis | Yes: fixed after 4.1.7 (#82219, #82329) |
+| 3 | **One query sees a transaction half-applied** | Inconsistent results, which can be stored | Root cause found and reproduced outside Antithesis | No report or fix found for the core cause |
 
 **1. A retried load is saved twice.** StarRocks promises that resending a load
 under the same label is safe: the duplicate is rejected, for up to 3 days. In

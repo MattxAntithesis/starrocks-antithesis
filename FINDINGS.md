@@ -5,11 +5,11 @@ We found three bugs in StarRocks 4.1.7, all against the official release images
 Antithesis run (`c7d09923c0006169e56a8e0b37ee9c3a-67-0`). Finding 3 came from a later run that
 added partition, table-rebuild and multi-table read checks (`05d22732e178b35d79c3fab4f7bc4287-67-0`).
 
-| # | What goes wrong | Impact | How solid |
-| --- | --- | --- | --- |
-| 1 | A retried load is saved twice | Silent duplicate data | Root cause found and reproduced outside Antithesis |
-| 2 | All three storage servers crash at once | Storage outage | Root cause found; already fixed upstream after 4.1.7 |
-| 3 | One query sees a transaction half-applied | Inconsistent results, which can be stored | Root cause found and reproduced outside Antithesis |
+| # | What goes wrong | Impact | How solid | Known upstream? |
+| --- | --- | --- | --- | --- |
+| 1 | A retried load is saved twice | Silent duplicate data | Root cause found and reproduced outside Antithesis | No report or fix found |
+| 2 | All three storage servers crash at once | Storage outage | Root cause found and reproduced outside Antithesis | Yes: fixed after 4.1.7 (#82219, #82329) |
+| 3 | One query sees a transaction half-applied | Inconsistent results, which can be stored | Root cause found and reproduced outside Antithesis | No report or fix found for the core cause |
 
 ---
 
@@ -226,7 +226,9 @@ far as we found.
 **Also seen in Antithesis**, with a multi-table Stream Load transaction: the read began 2 ms
 before the transaction became visible and saw 3 rows in `ev` and none in `ev2`.
 
-**Not yet done:** reporting it to StarRocks, and testing shared-data mode. We also saw a single
+**Not yet done:** reporting it to StarRocks, testing shared-data mode, and testing whether a
+materialized view refresh can store the half-applied state the way `INSERT ... SELECT` does.
+We also saw a single
 plain INSERT appear half-applied across two partitions of one table, once in about 8,500
 reads. The mechanism allows it, but one sighting is not enough to claim it.
 

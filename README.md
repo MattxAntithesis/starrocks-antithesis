@@ -12,7 +12,7 @@ All three bugs were found in the official 4.1.7 release images.
 | --- | --- | --- | --- |
 | 1 | **A retried load is saved twice** | Silent duplicate data | Root cause found and reproduced outside Antithesis |
 | 2 | **All three storage servers crash at once** | Storage outage | Root cause found; already fixed upstream after 4.1.7 |
-| 3 | **One query sees a transaction half-applied** | Inconsistent query results | Root cause found and reproduced outside Antithesis |
+| 3 | **One query sees a transaction half-applied** | Inconsistent results, which can be stored | Root cause found and reproduced outside Antithesis |
 
 **1. A retried load is saved twice.** StarRocks promises that resending a load
 under the same label is safe: the duplicate is rejected, for up to 3 days. In
@@ -35,7 +35,9 @@ StarRocks found and fixed the same crash independently after 4.1.7 was released
 transaction writing to several tables becomes visible all at once. A query reading
 two of those tables while the transaction commits can see it in one and not the
 other, because each table's version is picked separately, without a lock. About
-1 read in 440 under a steady write load. Script: [`repro/torn_read.sh`](repro/torn_read.sh).
+1 read in 440 under a steady write load. Inside an `INSERT ... SELECT`, the
+half-applied state is saved to a table for good. Scripts:
+[`repro/torn_read.sh`](repro/torn_read.sh), [`repro/torn_persist.sh`](repro/torn_persist.sh).
 
 Details, evidence and why these needed Antithesis: [FINDINGS.md](FINDINGS.md).
 

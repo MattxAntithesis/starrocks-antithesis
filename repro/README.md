@@ -13,6 +13,7 @@ cd loads/config && docker compose build
 | `run.sh` + `multi_table_txn.sh` | 2 | `MODE=multi ALTER_AT=during run.sh 20`: a column add during a multi-table load crashes every BE. `MODE=single` / `MODE=plain` are the controls |
 | `torn_read.sh` | 3 | `FILTER=1 REPL=1 torn_read.sh 90 32 4`: one SELECT sees a multi-table transaction in one table and not the other |
 | `torn_read_var.sh` | 3 | The same, with a configurable query (`QUERY`) and session settings (`PRE`), used to rule causes in and out |
+| `torn_persist.sh` | 3 | The torn read inside `INSERT ... SELECT`: the half-applied state is stored in a table |
 | `torn_partitions.sh` | 3 (weak) | The same race across two partitions of one table. Seen once in about 8,500 reads |
 
 Debugging aids for Finding 2, in `debug/`:

@@ -9,7 +9,7 @@ added partition, table-rebuild and multi-table read checks (`05d22732e178b35d79c
 | --- | --- | --- | --- |
 | 1 | A retried load is saved twice | Silent duplicate data | Root cause found and reproduced outside Antithesis |
 | 2 | All three storage servers crash at once | Storage outage | Root cause found; already fixed upstream after 4.1.7 |
-| 3 | One query sees a transaction half-applied | Inconsistent query results | Root cause found and reproduced outside Antithesis |
+| 3 | One query sees a transaction half-applied | Inconsistent results, which can be stored | Root cause found and reproduced outside Antithesis |
 
 ---
 
@@ -184,6 +184,16 @@ FILTER=1 REPL=1 repro/torn_read.sh 90 32 4
 In one 90-second run of this command, 5 of 2,205 reads were torn. In every torn read, the
 table planned first was one transaction behind. With the subquery order swapped, the one torn
 read we got lagged in the other table.
+
+**The wrong answer can be stored, not just shown.** When the torn read happens inside an
+`INSERT INTO ... SELECT`, the half-applied state is written to a table and stays there. In a
+3-minute run of [`repro/torn_persist.sh`](repro/torn_persist.sh), 4 clients ran
+`INSERT INTO snap SELECT (SELECT count(*) FROM a WHERE v > 0), (SELECT count(*) FROM b WHERE v > 0)`
+while transactions committed. 3 of the 2,813 stored rows hold counts that never existed
+together (for example 236 and 238). So any job that copies from several tables, such as an
+ETL step, a summary table or a reconciliation snapshot, can save inconsistent data with no
+error. That this goes through the same planner path is inferred from the identical
+signature (b one transaction ahead); we did not instrument this variant.
 
 **Cause (4.1.7 source, confirmed by instrumenting the running FE).**
 

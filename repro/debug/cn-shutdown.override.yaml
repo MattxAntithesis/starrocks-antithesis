@@ -1,0 +1,18 @@
+# Override for loads/config-shared used by repro/cn_shutdown_publish.sh.
+# cn1 runs with a single-thread publish pool, so publish tasks queue, and with
+# extra cn.conf lines from CN_EXTRA_CONF. CN_IMAGE selects the image (e.g. a gdb variant).
+services:
+  cn1:
+    image: ${CN_IMAGE:-starrocks-be-antithesis:latest}
+    cap_add: [SYS_PTRACE]
+    security_opt: ["seccomp=unconfined"]
+    environment:
+      BE_MODE: cn
+      CN_EXTRA_CONF: ${CN_EXTRA_CONF:-transaction_publish_version_worker_count = 1}
+    entrypoint:
+      - /bin/bash
+      - -c
+      - 'printf "%s\n" "$$CN_EXTRA_CONF" >> /opt/starrocks/be/conf/cn.conf; exec /entrypoint.sh'
+  fe:
+    environment:
+      FE_XMX: ${FE_XMX:-3g}

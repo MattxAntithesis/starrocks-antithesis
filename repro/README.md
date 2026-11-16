@@ -16,6 +16,8 @@ cd loads/config && docker compose build
 | `torn_persist.sh` | 3 | The torn read inside `INSERT ... SELECT`: the half-applied state is stored in a table |
 | `torn_partitions.sh` | 3 (weak) | The same race across two partitions of one table. Seen once in about 8,500 reads |
 
+| `cn_shutdown_publish.sh` (+ `_setup`, `_load`) | 4 | Shared-data CN stopped with publish work queued. `GDB=1` (needs a gdb image as `CN_IMAGE`, see `debug/Dockerfile.be-gdb`) widens the race with `debug/l6_widen.gdb` and crashes 5/5; `L6_ADDR=0x10e7a6d9` is the control |
+
 Debugging aids for Finding 2, in `debug/`:
 
 - `run_gdb.sh` attaches gdb to a BE (`debug/Dockerfile.be-gdb`, `debug/catch.py`) and dumps the

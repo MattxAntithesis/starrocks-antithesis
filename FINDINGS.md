@@ -1,15 +1,17 @@
 # Findings: StarRocks 4.1.7
 
-We found three bugs in StarRocks 4.1.7, all against the official release images
+We found four bugs in StarRocks 4.1.7, all against the official release images
 (`starrocks/{fe,be}-ubuntu:4.1.7`, build `b81ff9c`). Findings 1 and 2 came from one 90-minute
 Antithesis run (`c7d09923c0006169e56a8e0b37ee9c3a-67-0`). Finding 3 came from a later run that
 added partition, table-rebuild and multi-table read checks (`05d22732e178b35d79c3fab4f7bc4287-67-0`).
+Finding 4 came from a shared-data run (`6efc9d648a0c3c0bf66fc45cc9a085f7-67-6`).
 
 | # | What goes wrong | Impact | How solid | Known upstream? |
 | --- | --- | --- | --- | --- |
 | 1 | A retried load is saved twice | Silent duplicate data | Root cause found and reproduced outside Antithesis | No report or fix found |
 | 2 | All three storage servers crash at once | Storage outage | Root cause found and reproduced outside Antithesis | Yes: fixed after 4.1.7 (#82219, #82329) |
 | 3 | One query sees a transaction half-applied | Inconsistent results, which can be stored | Root cause found and reproduced outside Antithesis | No report or fix found for the core cause |
+| 4 | A compute node crashes while shutting down | Crash on restart, in-flight publishes fail | Root cause found; reproduced outside Antithesis with a debugger widening the race | No report or fix found |
 
 ---
 
@@ -242,9 +244,74 @@ reads. The mechanism allows it, but one sighting is not enough to claim it.
 
 ---
 
+## Finding 4: a compute node can crash while shutting down (shared-data)
+
+**In one line:** when a compute node is stopped normally while it has publish work queued, it
+can segfault instead of exiting. Publishing is the step that makes newly loaded data visible.
+
+**What happens.** On shutdown the CN cancels the tasks still waiting in its publish thread pool.
+Each cancelled task's callback takes a lock, records the failure, and then signals "done" to the
+request handler waiting on all the tasks. The lock and the "done" counter live in that handler's
+stack frame. When the last task signals "done", the handler wakes, returns, and its frame (lock
+included) is gone. The callback then releases the lock it is still holding, which is freed
+memory, and the process segfaults.
+
+```
+SIGSEGV (@0x0)  bthread::butex_wake
+                bthread_mutex_unlock
+                LakeServiceImpl::_submit_publish_log_version_task(...)::{lambda}   <- cancel callback
+                ThreadPool::_pop_and_cancel_tasks_in_queue
+                ThreadPool::shutdown
+                AgentServer::Impl::stop
+                ExecEnv::stop
+                start_be
+```
+
+**The code** (`be/src/service/service_be/lake_service.cpp`, `_submit_publish_log_version_task`,
+4.1.7 and unchanged on `main`). The cancel callback signals while still holding the lock:
+
+```cpp
+[&] {                                   // cancel callback
+    ...
+    std::lock_guard l(response_mtx);    // response_mtx and latch are the handler's locals
+    response->add_failed_tablets(tablet_id);
+    latch.count_down();                 // may release the handler, which frees both
+});                                     // lock_guard now unlocks freed memory
+```
+
+The normal path gets the order right: its `count_down()` runs from a `DeferOp` declared before
+the lock, so it happens after the lock is released.
+
+**When it happens.** These tasks (`publish_log_version`) are sent when loads commit into a
+shared-data table with a schema change in progress. So the trigger is a CN being stopped or
+restarted (rolling restart, scale-in, upgrade) while loads and a schema change are running, and
+while publish work is backed up, for example because object storage is slow. The crash itself
+needs the waiting handler to free its frame in the few instructions between the "done" signal
+and the unlock, so it is rare.
+
+**Reproduced outside Antithesis, with help.** [`repro/cn_shutdown_publish.sh`](repro/cn_shutdown_publish.sh)
+starts a shared-data cluster with a one-thread publish pool. It pins a schema change, runs loads,
+pauses the S3 store so publish tasks queue, and then stops the CN.
+- With gdb pausing the callback right after `count_down()` and before the unlock
+  ([`repro/debug/l6_widen.gdb`](repro/debug/l6_widen.gdb)): **5 of 5 stops crash**, with the
+  same stack and the same addresses as the Antithesis crash.
+- Control, pausing just before `count_down()`: 0 of 3.
+- With no debugger: 0 of 15 stops with up to 60 queued tasks. The window is too narrow to hit by
+  chance on a two-core VM. Antithesis reached it by exploring thread timing.
+
+**Impact.** The node was stopping anyway. It ends in a segfault instead of a clean exit, and the
+publishes it was cancelling report failure, so those loads must be retried. In the run that found
+it, all data checks passed once faults stopped. We saw no data effect, but have not proven there is
+none.
+
+**Not yet done:** reporting it to StarRocks. This is the same family as a 3.5.19 shutdown crash we
+saw earlier (a publish task touching torn-down state during BE shutdown), but different code.
+
+---
+
 ## Why these bugs needed Antithesis
 
-All three bugs are in code StarRocks already tests heavily. Here is why ordinary methods
+All four bugs are in code StarRocks already tests heavily. Here is why ordinary methods
 missed them, and what was different here.
 
 **1. The duplicate-data bug is invisible to normal testing.** No error, no crash and no

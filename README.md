@@ -6,13 +6,14 @@ cut the network, paused processes, skewed clocks and varied CPU speed.
 
 ## What it found
 
-All three bugs were found in the official 4.1.7 release images.
+All four bugs were found in the official 4.1.7 release images.
 
 | | Bug | Impact | Status | Known upstream? |
 | --- | --- | --- | --- | --- |
 | 1 | **A retried load is saved twice** | Silent duplicate data | Root cause found and reproduced outside Antithesis | No report or fix found |
 | 2 | **All three storage servers crash at once** | Storage outage | Root cause found and reproduced outside Antithesis | Yes: fixed after 4.1.7 (#82219, #82329) |
 | 3 | **One query sees a transaction half-applied** | Inconsistent results, which can be stored | Root cause found and reproduced outside Antithesis | No report or fix found for the core cause |
+| 4 | **A compute node crashes while shutting down** | Crash on restart, in-flight publishes fail | Root cause found; reproduced outside Antithesis with a debugger widening the race | No report or fix found |
 
 **1. A retried load is saved twice.** StarRocks promises that resending a load
 under the same label is safe: the duplicate is rejected, for up to 3 days. In
@@ -39,17 +40,23 @@ other, because each table's version is picked separately, without a lock. About
 half-applied state is saved to a table for good. Scripts:
 [`repro/torn_read.sh`](repro/torn_read.sh), [`repro/torn_persist.sh`](repro/torn_persist.sh).
 
+**4. A compute node crashes while shutting down (shared-data).** Stopping a compute
+node while it has publish work queued can segfault it. A cancelled task signals
+"done" while still holding a lock that belongs to the waiting request, which frees
+the lock before it is released. Rare, and reproduced with a debugger holding the
+window open. Script: [`repro/cn_shutdown_publish.sh`](repro/cn_shutdown_publish.sh).
+
 Details, evidence and why these needed Antithesis: [FINDINGS.md](FINDINGS.md).
 
 ## What's in this repo
 
 | File | What it is |
 | --- | --- |
-| [FINDINGS.md](FINDINGS.md) | All three bugs, the evidence, and why ordinary testing missed them |
+| [FINDINGS.md](FINDINGS.md) | All four bugs, the evidence, and why ordinary testing missed them |
 | [REPORT-label-dedup.md](REPORT-label-dedup.md) | Bug 1 written up for StarRocks engineers: causal chain, code walk, reproduction steps |
 | [BUG-HISTORY.md](BUG-HISTORY.md) | How we chose what to test: 338 past StarRocks bug fixes, ranked by how often they were backported |
 | [`loads/`](loads/README.md) | The test workload: deployment, driver, and every property it checks |
-| [`repro/`](repro/) | Standalone reproductions of all three bugs: no Antithesis, no faults |
+| [`repro/`](repro/) | Standalone reproductions of all four bugs: no Antithesis, no faults |
 
 ## The workload
 

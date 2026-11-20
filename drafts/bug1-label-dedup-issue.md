@@ -5,7 +5,7 @@ Hello,
 
 When testing StarRocks with [Antithesis](https://antithesis.com/), we found that a load retried under the same label can be applied twice. Labels are documented to deduplicate retries for 3 days (`label_keep_max_second`), but `label_keep_max_num` (1,000 per database) evicts them regardless of age, and an FE restart enforces that cap within a second.
 
-## StarRocks version (Required)
+## StarRocks version
 
 4.1.7-b81ff9c. Code unchanged on `main`.
 
@@ -19,7 +19,7 @@ When testing StarRocks with [Antithesis](https://antithesis.com/), we found that
 2. More than `label_keep_max_num` transactions finish in the database after it.
 3. The label cleaner runs: on FE startup, on every checkpoint, or every 4 hours.
 
-## Steps to reproduce the behavior (Required)
+## Steps to reproduce the behavior
 
 1. Set `label_keep_max_num = 2` in `fe.conf` and start a cluster.
 2. Stream Load 5 rows into a table under label `L`.
@@ -31,11 +31,11 @@ When testing StarRocks with [Antithesis](https://antithesis.com/), we found that
 
 Script: [`repro/label_dedup.sh`](https://github.com/MattxAntithesis/starrocks-antithesis/blob/main/repro/label_dedup.sh)
 
-## Expected behavior (Required)
+## Expected behavior
 
 Step 7 returns `Label Already Exists`.
 
-## Real behavior (Required)
+## Real behavior
 
 Step 7 returns `Success`. The table holds `L`'s 5 rows twice (25 rows instead of 20).
 

@@ -5,7 +5,7 @@ Hello,
 
 When testing StarRocks with [Antithesis](https://antithesis.com/), we found that one query reading two tables can see a committed multi-table transaction in one table but not the other. Commit is atomic, but the planner reads each table's visible version separately, without a lock, while the transaction can become visible in between.
 
-## StarRocks version (Required)
+## StarRocks version
 
 4.1.7-b81ff9c, shared-nothing and shared-data.
 
@@ -20,7 +20,7 @@ When testing StarRocks with [Antithesis](https://antithesis.com/), we found that
 
 No faults needed.
 
-## Steps to reproduce the behavior (Required)
+## Steps to reproduce the behavior
 
 1. Create two identical tables:
    ```sql
@@ -34,11 +34,11 @@ No faults needed.
 
 Script: [`repro/torn_read.sh`](https://github.com/MattxAntithesis/starrocks-antithesis/blob/main/repro/torn_read.sh)
 
-## Expected behavior (Required)
+## Expected behavior
 
 Both counts are always equal.
 
-## Real behavior (Required)
+## Real behavior
 
 About 1 read in 440 returns different counts (5 of 2,205 in one 90-second run, for example `236 238`). On shared-data it is about 1 in 97. Using `INSERT INTO snap SELECT ...` with the same query, 3 of 2,813 stored rows held counts that never coexisted.
 

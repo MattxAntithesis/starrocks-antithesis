@@ -4,7 +4,7 @@
 # Build from antithesis/loads/config-shared with `docker compose build`.
 x-cn: &cn
   platform: linux/amd64
-  image: starrocks-be-antithesis:latest
+  image: ${BE_IMAGE:-starrocks-be-antithesis:latest}
   depends_on: [fe]
   environment:
     BE_MODE: cn
@@ -27,6 +27,19 @@ services:
     depends_on: [s3]
     environment:
       FE_RUN_MODE: shared_data
+      # Make shared-data background work frequent enough to collide with loads
+      # and faults: autovacuum every 10 s per partition, full vacuum (orphan
+      # file cleanup, off by default) every minute, compaction at a low score.
+      # The vacuum grace period stays at 2 minutes, longer than any query the
+      # driver runs (10-15 s timeouts), as StarRocks requires; a missing file
+      # is then StarRocks' bug, not this configuration's.
+      FE_EXTRA_CONF: |
+        lake_autovacuum_partition_naptime_seconds = 10
+        lake_autovacuum_grace_period_minutes = 2
+        lake_enable_fullvacuum = true
+        lake_fullvacuum_partition_naptime_seconds = 60
+        lake_compaction_score_selector_min_score = 2
+        lake_compaction_interval_ms_on_success = 1000
     build:
       context: ..
       dockerfile: fe/Dockerfile
@@ -39,7 +52,7 @@ services:
     hostname: cn1
     build:
       context: ..
-      dockerfile: be/Dockerfile
+      dockerfile: ${BE_DOCKERFILE:-be/Dockerfile}
       args:
         STARROCKS_VERSION: ${STARROCKS_VERSION:-4.1.7}
   cn2:

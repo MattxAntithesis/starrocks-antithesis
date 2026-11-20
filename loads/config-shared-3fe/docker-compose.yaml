@@ -1,0 +1,102 @@
+# Antithesis "loads" workload: shared-data mode with FE leader failover.
+# 3 FEs in run_mode shared_data (fe1 starts as leader; fe2/fe3 join as
+# followers), 2 compute nodes (the BE image run as CN; shared-data needs no
+# replicas, and the third FE needs the memory), an S3-compatible store
+# (SeaweedFS), and the driver. Combines config-3fe and config-shared.
+# Build from antithesis/loads/config-shared-3fe with `docker compose build`.
+x-fe-env: &fe-env
+  FE_RUN_MODE: shared_data
+  # Three FEs, two CNs and the S3 store share one Antithesis machine.
+  FE_XMX: 1024m
+  # Frequent shared-data background work, as in config-shared: autovacuum every
+  # 10 s, full vacuum every minute, compaction at a low score. The 2-minute
+  # vacuum grace period stays longer than any query the driver runs.
+  FE_EXTRA_CONF: |
+    lake_autovacuum_partition_naptime_seconds = 10
+    lake_autovacuum_grace_period_minutes = 2
+    lake_enable_fullvacuum = true
+    lake_fullvacuum_partition_naptime_seconds = 60
+    lake_compaction_score_selector_min_score = 2
+    lake_compaction_interval_ms_on_success = 1000
+
+x-fe: &fe
+  platform: linux/amd64
+  image: starrocks-fe-antithesis:latest
+
+x-cn: &cn
+  platform: linux/amd64
+  image: ${BE_IMAGE:-starrocks-be-antithesis:latest}
+  depends_on: [fe1]
+  environment:
+    BE_MODE: cn
+
+services:
+  s3:
+    container_name: s3
+    hostname: s3
+    platform: linux/amd64
+    image: starrocks-s3-antithesis:latest
+    build:
+      context: ..
+      dockerfile: s3/Dockerfile
+
+  fe1:
+    <<: *fe
+    container_name: fe1
+    hostname: fe1
+    depends_on: [s3]
+    environment:
+      <<: *fe-env
+    build:
+      context: ..
+      dockerfile: fe/Dockerfile
+      args:
+        STARROCKS_VERSION: ${STARROCKS_VERSION:-4.1.7}
+  fe2:
+    <<: *fe
+    container_name: fe2
+    hostname: fe2
+    depends_on: [fe1]
+    environment:
+      <<: *fe-env
+      FE_HELPER: fe1:9010
+  fe3:
+    <<: *fe
+    container_name: fe3
+    hostname: fe3
+    depends_on: [fe1]
+    environment:
+      <<: *fe-env
+      FE_HELPER: fe1:9010
+
+  cn1:
+    <<: *cn
+    container_name: cn1
+    hostname: cn1
+    build:
+      context: ..
+      dockerfile: ${BE_DOCKERFILE:-be/Dockerfile}
+      args:
+        STARROCKS_VERSION: ${STARROCKS_VERSION:-4.1.7}
+  cn2:
+    <<: *cn
+    container_name: cn2
+    hostname: cn2
+
+  driver:
+    container_name: driver
+    hostname: driver
+    platform: linux/amd64
+    image: starrocks-loads-driver:latest
+    build:
+      context: ..
+      dockerfile: driver/Dockerfile
+    environment:
+      DRIVER_MULTI_TABLE_TXN: "on"
+      DRIVER_SHARED_DATA: "on"
+      # The first FE is the initial leader; the driver adds the others as followers.
+      FE_HOSTS: fe1,fe2,fe3
+      # Followers may serve reads from stale metadata by design; read through the leader.
+      DRIVER_FORWARD_TO_LEADER: "on"
+      BE_HOSTS: cn1,cn2
+      RUST_BACKTRACE: "1"

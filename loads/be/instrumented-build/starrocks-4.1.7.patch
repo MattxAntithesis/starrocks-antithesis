@@ -1,0 +1,28 @@
+diff --git a/be/CMakeLists.txt b/be/CMakeLists.txt
+index 7e5830eea4..47d0726469 100644
+--- a/be/CMakeLists.txt
++++ b/be/CMakeLists.txt
+@@ -205,7 +205,8 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+     if (NOT ${MAKE_TEST} STREQUAL "ON")
+         # there are too many warnings reported by clang in be/test and it will take some time to fix.
+         # temporarily disable Werror in the unit test so that clang can compile.
+-        set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -Werror")
++        # Antithesis build: -Werror dropped, Clang 18 reports warnings 4.1.7 was not built against.
++        # set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -Werror")
+     endif()
+     set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -Wno-unused-parameter -Wno-documentation -Wno-weak-vtables")
+     set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -Wno-unknown-warning-option")
+diff --git a/be/src/service/starrocks_main.cpp b/be/src/service/starrocks_main.cpp
+index d9cd1d0a06..1e7a277747 100644
+--- a/be/src/service/starrocks_main.cpp
++++ b/be/src/service/starrocks_main.cpp
+@@ -32,6 +32,9 @@
+ // specific language governing permissions and limitations
+ // under the License.
+ 
++// Antithesis coverage instrumentation: forwards sanitizer-coverage callbacks to
++// libvoidstar when running in Antithesis. Must be in exactly one translation unit.
++#include "antithesis_instrumentation.h"
+ #include <gperftools/malloc_extension.h>
+ #include <sys/file.h>
+ #include <unistd.h>

@@ -10,7 +10,7 @@ x-fe: &fe
     FE_XMX: 1024m
 x-be: &be
   platform: linux/amd64
-  image: starrocks-be-antithesis:latest
+  image: ${BE_IMAGE:-starrocks-be-antithesis:latest}
   depends_on: [fe1]
 
 services:
@@ -48,7 +48,7 @@ services:
     # Only be1 builds the shared BE image.
     build:
       context: ..
-      dockerfile: be/Dockerfile
+      dockerfile: ${BE_DOCKERFILE:-be/Dockerfile}
       args:
         STARROCKS_VERSION: ${STARROCKS_VERSION:-4.1.7}
   be2:

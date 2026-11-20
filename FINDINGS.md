@@ -1,10 +1,11 @@
 # Findings: StarRocks 4.1.7
 
-We found four bugs in StarRocks 4.1.7, all against the official release images
+We found five bugs in StarRocks 4.1.7, all against the official release images
 (`starrocks/{fe,be}-ubuntu:4.1.7`, build `b81ff9c`). Findings 1 and 2 came from one 90-minute
 Antithesis run (`c7d09923c0006169e56a8e0b37ee9c3a-67-0`). Finding 3 came from a later run that
 added partition, table-rebuild and multi-table read checks (`05d22732e178b35d79c3fab4f7bc4287-67-0`).
-Finding 4 came from a shared-data run (`6efc9d648a0c3c0bf66fc45cc9a085f7-67-6`).
+Finding 4 came from a shared-data run (`6efc9d648a0c3c0bf66fc45cc9a085f7-67-6`). Finding 5 came
+from the first run with an Antithesis-instrumented BE (`49b70483ef11574867ea0dbfe3415d47-67-6`).
 
 | # | What goes wrong | Impact | How solid | Known upstream? |
 | --- | --- | --- | --- | --- |
@@ -12,6 +13,7 @@ Finding 4 came from a shared-data run (`6efc9d648a0c3c0bf66fc45cc9a085f7-67-6`).
 | 2 | All three storage servers crash at once | Storage outage | Root cause found and reproduced outside Antithesis | Yes: fixed after 4.1.7 (#82219, #82329) |
 | 3 | One query sees a transaction half-applied | Inconsistent results, which can be stored | Root cause found and reproduced outside Antithesis | No report or fix found for the core cause |
 | 4 | A compute node crashes while shutting down | Crash on restart, in-flight publishes fail | Root cause found; reproduced outside Antithesis with a debugger widening the race | No report or fix found |
+| 5 | `OPTIMIZE` deletes a row the database just confirmed | Silent data loss | Root cause found; reproduced outside Antithesis with a debugger widening the race | Yes: reported in #80731, fixed after 4.1.7 in #77754, not yet in a release |
 
 ---
 
@@ -309,9 +311,67 @@ saw earlier (a publish task touching torn-down state during BE shutdown), but di
 
 ---
 
+## Finding 5: `ALTER TABLE ... OPTIMIZE` can delete a row the database just confirmed
+
+**In one line:** an `INSERT` that is acknowledged OK in the last few milliseconds before an
+`OPTIMIZE` finishes can be silently lost. No error, and the load is recorded as successful.
+
+**What happens.** `OPTIMIZE` (changing a table's bucket count, sort key or distribution) copies
+each partition into a temporary partition, then swaps the copy in and deletes the original. Loads
+are allowed to keep running meanwhile. Just before the swap, the job checks whether a partition
+received new data during the copy, and if so skips that partition. But it only checks the
+partition's *visible* version, which moves only once a load is fully published. A load that has
+committed but not yet published, a gap of a few milliseconds, passes the check. The swap then
+deletes the original partition, data included. When the load's publish runs, its partition no
+longer exists. The FE logs `partition ... is dropped, skip version check`, drops that partition
+from the transaction and marks the transaction VISIBLE. The client gets OK; the row is gone.
+
+**The code** (`fe/fe-core/src/main/java/com/starrocks/alter/OptimizeJobV2.java`, 4.1.7):
+
+- `onFinished` compares each source partition's visible version with the version the rewrite
+  started from. A committed-but-unpublished load leaves the visible version unchanged.
+- The committed-but-not-visible guard (`hasCommittedNotVisible`) is applied only to the
+  *temporary* partition, never to the source partition being replaced.
+- `DatabaseTransactionMgr.finishTransaction` skips partitions that have been dropped instead of
+  failing the transaction.
+
+With the default `enable_online_optimize_table = false`, every `OPTIMIZE` in 4.1.7 runs this job.
+
+**Seen in Antithesis.** The workload inserted one row into partition `p3`, labelled `pt_247`. The
+FE committed it, and 50 ms later an `OPTIMIZE` changing the bucket count swapped `p3` for its
+copy. The publish then logged `partition 12254 is dropped, skip version check` and made the
+transaction VISIBLE. The `INSERT` returned OK, and the next read of `p3` didn't have the row. No
+fault was involved at that moment.
+
+**Reproduced outside Antithesis, with help.**
+[`repro/optimize_loss_jdb.sh`](repro/optimize_loss_jdb.sh) starts a 1-FE/3-BE cluster on the
+stock 4.1.7 images. It starts an `OPTIMIZE`, waits for the copy to finish, and then uses jdb to
+pause only the FE's publish thread while one `INSERT` commits. The `OPTIMIZE` finishes and the
+publish is released.
+- **3 of 3 runs lost the acknowledged row**, with the same `partition ... is dropped` log line as
+  in Antithesis.
+- Control (`CONTROL=1`, the same pause with no `OPTIMIZE`): the row is there.
+- With no debugger ([`repro/optimize_loss.sh`](repro/optimize_loss.sh)): 0 rows lost across 15
+  `OPTIMIZE` runs and about 24,000 inserts. Continuous inserts trip the version check and the
+  partition is skipped; a loss needs a load to commit in the milliseconds before the swap.
+
+**Impact.** Silent loss of acknowledged rows, with the load recorded as successful. Only a row
+count or checksum against the source reveals it. It needs no fault, just loads running while an
+`OPTIMIZE` finishes. Each occurrence loses the loads caught in that window, not the table.
+
+**Already fixed upstream, after 4.1.7.** Reported by another user in
+[#80731](https://github.com/StarRocks/starrocks/issues/80731) (2026-10-14), from a stress test where
+row counts came up short while every load reported FINISHED. Fixed in
+[#77754](https://github.com/StarRocks/starrocks/pull/77754) (merged 2026-11-02), which checks
+committed and in-flight transactions per source partition before the swap, and backported to the
+4.1 branch. 4.1.7 (released 2026-11-03) doesn't include it, and no 4.1 release does yet. We worked
+out the cause from the run and the 4.1.7 source before finding the fix; its description matches.
+
+---
+
 ## Why these bugs needed Antithesis
 
-All four bugs are in code StarRocks already tests heavily. Here is why ordinary methods
+All five bugs are in code StarRocks already tests heavily. Here is why ordinary methods
 missed them, and what was different here.
 
 **1. The duplicate-data bug is invisible to normal testing.** No error, no crash and no
@@ -341,7 +401,13 @@ including reads that compare two tables in one statement, and that is what flagg
 run's single ordered log then showed the query starting 2 ms before the transaction became
 visible, which pointed straight at the planner.
 
-**4. One exact story across every machine.** Normally you piece a cluster bug together
+**4. It found a data loss that lasts milliseconds.** Finding 5 needs a load to commit in the few
+milliseconds between an `OPTIMIZE`'s last check and its swap. Our own stress test of the same
+operations, 24,000 inserts across 15 `OPTIMIZE` runs, never lost a row. Antithesis hit it in a
+2.5-hour run, and its ordered log showed the commit, the swap 50 ms later and the publish that
+skipped the deleted partition, which is the whole causal chain.
+
+**5. One exact story across every machine.** Normally you piece a cluster bug together
 from separate logs on separate machines, with clocks that disagree. Antithesis gives a
 single timeline of the FE, all three BEs, the client and every injected fault, in exact
 order. That is how we could say the label was deleted 1 second after the restart and 147
@@ -349,19 +415,21 @@ seconds after the load, and connect it straight to the line of code responsible.
 
 **Replaying a moment with changes.** Any moment of a run can be reopened and run forward
 differently, for example without a fault or without a concurrent operation. That is the tool
-for bugs that won't reproduce outside the simulator. All three here did reproduce outside it,
+for bugs that won't reproduce outside the simulator. All five here did reproduce outside it (two
+with a debugger holding the race open),
 so the standalone scripts in [`repro/`](repro/) are the evidence.
 
 ---
 
 ## Limits of this testing
 
-- **Only the FE was instrumented.** The C++ BE ran from the stock image, so Antithesis had
-  no coverage feedback or thread pausing inside the storage engine. An instrumented BE
-  build would make this testing much stronger.
+- **The BE was instrumented only from Finding 5's run on.** Earlier runs used the stock BE, so
+  Antithesis had no coverage feedback or thread pausing inside the storage engine. The
+  instrumented build ([`loads/be/instrumented-build/`](loads/be/instrumented-build/)) gives it
+  about 4.7 million coverage points in `starrocks_be`.
 - **A passing property means only what the run reached.** See `loads/README.md` for the
   fault-density check that guards against tests passing because no faults happened.
 - **Setup workaround.** Antithesis containers report about 4.9 GB of disk, and the FE
   refuses to start below 5 GB. We patched bdb-je's `je.freeDisk` in the FE jar
-  (`loads/fe/patch_je_free_disk.py`). This only affects startup and is unrelated to either
+  (`loads/fe/patch_je_free_disk.py`). This only affects startup and is unrelated to any
   finding. Asking Antithesis for more machine memory would remove the need for the patch.

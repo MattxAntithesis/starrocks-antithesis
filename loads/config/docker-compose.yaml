@@ -2,7 +2,7 @@
 # Build from antithesis/loads/config with `docker compose build`.
 x-be: &be
   platform: linux/amd64
-  image: starrocks-be-antithesis:latest
+  image: ${BE_IMAGE:-starrocks-be-antithesis:latest}
   depends_on: [fe]
 
 services:
@@ -26,7 +26,7 @@ services:
     # Only be1 builds the shared BE image (parallel builds of one tag collide).
     build:
       context: ..
-      dockerfile: be/Dockerfile
+      dockerfile: ${BE_DOCKERFILE:-be/Dockerfile}
       args:
         STARROCKS_VERSION: ${STARROCKS_VERSION:-4.1.7}
   be2:

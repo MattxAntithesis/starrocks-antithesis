@@ -14,6 +14,7 @@ mod client;
 mod inspect;
 mod model;
 mod part;
+mod qc;
 
 use antithesis_sdk::prelude::*;
 use antithesis_sdk::{assert_always, assert_reachable, assert_sometimes};
@@ -96,6 +97,8 @@ pub struct Inner {
     txn_alter_gate: RwLock<()>,
     last_heavy: Mutex<Option<Instant>>,
     pt: Mutex<part::PartState>,
+    /// The static dataset of the query-correctness checks (qc.rs).
+    qc_data: qc::Data,
     next_tag: AtomicI64,
     /// Columns this workload added to `ev`/`ev2`, so it can drop them again.
     added_columns: Mutex<HashMap<&'static str, Vec<String>>>,
@@ -269,6 +272,30 @@ fn all_backends_alive(cl: &Cluster) -> Result<(), String> {
     }
 }
 
+/// Runs one query (after optional SET statements) and returns its rows as text.
+fn qc_query(cl: &Cluster, settings: &[String], sql: &str) -> Result<qc::Got, String> {
+    let mut c = cl.conn(false, Duration::from_secs(20))?;
+    for st in settings {
+        c.query_drop(st).map_err(|e| format!("SET failed: {st}: {e}"))?;
+    }
+    let rows: Vec<mysql::Row> = c.query(sql).map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            r.unwrap()
+                .into_iter()
+                .map(|v| match v {
+                    mysql::Value::NULL => None,
+                    mysql::Value::Bytes(b) => Some(String::from_utf8_lossy(&b).to_string()),
+                    mysql::Value::Int(i) => Some(i.to_string()),
+                    mysql::Value::UInt(u) => Some(u.to_string()),
+                    other => Some(format!("{other:?}")),
+                })
+                .collect()
+        })
+        .collect())
+}
+
 fn startup(cl: &Cluster) {
     wait_for("FE answers queries", || sql_ok(cl, false, "SELECT 1"));
     // Followers wait in their entrypoint until the leader lists them, then join.
@@ -320,6 +347,22 @@ fn startup(cl: &Cluster) {
         wait_for(&format!("ddl {}", &ddl[..ddl.len().min(40)]), || sql_ok(cl, false, ddl));
     }
     let mut id = 0;
+    // Query-correctness tables: loaded once, never written again (qc.rs).
+    for ddl in qc::DDL {
+        wait_for(&format!("qc ddl {}", &ddl[..ddl.len().min(40)]), || sql_ok(cl, false, ddl));
+    }
+    let data = qc::Data::generate();
+    for ins in data.insert_statements() {
+        wait_for(&format!("qc load {}", &ins[..ins.len().min(40)]), || match exec_dml(cl, &ins, WRITE_TIMEOUT) {
+            Outcome::Visible | Outcome::LabelExists => Ok(()),
+            o => Err(format!("{} {}", o.kind(), o.msg())),
+        });
+    }
+    let fin = qc::final_case(&data);
+    wait_for("qc static tables loaded and verified", || {
+        let got = qc_query(cl, &[], &fin.sql)?;
+        fin.check(&got)
+    });
     wait_for("probe write and read", || {
         id += 1;
         probe(cl, -id)
@@ -362,6 +405,7 @@ impl Driver {
             txn_alter_gate: RwLock::new(()),
             last_heavy: Mutex::new(None),
             pt: Mutex::new(part::PartState::default()),
+            qc_data: qc::Data::generate(),
             next_tag: AtomicI64::new(1),
             added_columns: Mutex::new(HashMap::new()),
             next_alter: AtomicI64::new(1),
@@ -557,6 +601,7 @@ impl Driver {
             Ok(r) => r,
             Err(e) => {
                 self.count("kv_read:failed");
+                self.read_failed("kv", &e);
                 tc.note(&format!("kv read failed: {e}"));
                 return;
             }
@@ -816,9 +861,13 @@ impl Driver {
             .conn(true, READ_TIMEOUT)
             .and_then(|mut c| c.query(&sql).map_err(|e| e.to_string()));
         let end = Instant::now();
-        let Ok(rows) = res else {
-            self.count("pk_read:failed");
-            return;
+        let rows = match res {
+            Ok(r) => r,
+            Err(e) => {
+                self.count("pk_read:failed");
+                self.read_failed("pk", &e);
+                return;
+            }
         };
         self.count("pk_read:ok");
         let mut got: HashMap<i32, (i64, String, i64)> = HashMap::new();
@@ -1318,6 +1367,9 @@ impl Driver {
         let ev = self.read_counts("ev", Some(&ids));
         let ev2 = if multi { Some(self.read_counts("ev2", Some(&ids))) } else { None };
         let end = Instant::now();
+        if let Err(e) = &ev {
+            self.read_failed("batch", e);
+        }
         let Ok(ev) = ev else {
             self.count("batch_read:failed");
             tc.note(&format!("batch read failed: {:?}", ev.err()));
@@ -1465,6 +1517,9 @@ impl Driver {
                 "transactions are committed but not yet published",
                 &json!({"committed_unpublished": n})
             );
+        }
+        if shared_data() {
+            self.observe_lake_compactions();
         }
         if let Ok(n) = inspect::repairs_in_flight(&self.cl) {
             antithesis_sdk::assert_sometimes_greater_than!(
@@ -1708,6 +1763,18 @@ impl Driver {
                 &json!({"phase": "final kv scan", "error": e})),
         }
         self.mv_final();
+        {
+            let fin = qc::final_case(&self.qc_data);
+            match qc_query(&self.cl, &[], &fin.sql) {
+                Ok(got) => {
+                    let r = fin.check(&got);
+                    assert_always!(r.is_ok(), "qc: the static tables still hold exactly the rows loaded",
+                        &json!({"mismatch": r.err()}));
+                }
+                Err(e) => assert_always!(false, "the cluster serves reads and writes again once faults stop",
+                    &json!({"phase": "final qc scan", "error": e})),
+            }
+        }
         for p in 0..part::PARTITIONS.len() {
             if let Err(e) = self.pt_check(p, true) {
                 assert_always!(false, "the cluster serves reads and writes again once faults stop",
@@ -1830,6 +1897,53 @@ impl Driver {
         let p = tc.draw(gs::integers::<usize>().min_value(0).max_value(part::PARTITIONS.len() - 1));
         let r = self.pt_check(p, false);
         self.count(format!("pt_read:{}", if r.is_ok() { "ok" } else { "failed" }));
+        if let Err(e) = &r {
+            self.read_failed("pt", e);
+        }
+    }
+
+    /// A read that fails because a data file is gone. In shared-data mode,
+    /// vacuum deletes old versions' files only after a 2-minute grace period,
+    /// longer than any read here, so this would mean live data was deleted.
+    /// During faults a read may also fail for many legitimate reasons, so this
+    /// is a signal (logged, steered toward), and the final checks once faults
+    /// stop are what decide.
+    fn read_failed(&self, what: &str, e: &str) {
+        let l = e.to_lowercase();
+        let missing = ["nosuchkey", "no such file", "not found", "does not exist", "404"]
+            .iter()
+            .any(|p| l.contains(p))
+            && !l.contains("label");
+        if missing {
+            self.count("read:missing_file");
+            log(format!("{what} read failed, file missing?: {}", trunc(e)));
+        }
+        assert_sometimes!(missing, "a read fails with a missing-file error",
+            &json!({"what": what, "error": trunc(e)}));
+    }
+
+    /// Shared-data only: lake compactions, from `SHOW PROC '/compactions'`.
+    fn observe_lake_compactions(&self) {
+        let rows: Result<Vec<mysql::Row>, String> = self.cl.conn(false, READ_TIMEOUT)
+            .and_then(|mut c| c.query("SHOW PROC '/compactions'").map_err(|e| e.to_string()));
+        let Ok(rows) = rows else { return };
+        let (mut running, mut finished, mut failed) = (0i64, 0i64, 0i64);
+        for row in rows {
+            let get = |name: &str| -> Option<String> {
+                let i = row.columns().iter().position(|c| c.name_str() == name)?;
+                row.get_opt::<Option<String>, _>(i).and_then(|r| r.ok()).flatten()
+            };
+            if get("Error").map_or(false, |e| !e.is_empty()) {
+                failed += 1;
+            } else if get("FinishTime").is_some() {
+                finished += 1;
+            } else {
+                running += 1;
+            }
+        }
+        let d = json!({"running": running, "finished": finished, "failed": failed});
+        antithesis_sdk::assert_sometimes_greater_than!(running, 0, "shared-data: a compaction is in flight", &d);
+        antithesis_sdk::assert_sometimes_greater_than!(finished, 0, "shared-data: compactions finish", &d);
     }
 
     // ----- materialized view --------------------------------------------------
@@ -1870,6 +1984,7 @@ impl Driver {
             }
             Err(e) => {
                 self.count("mv_read:failed");
+                self.read_failed("mv", &e);
                 tc.note(&format!("mv read failed: {e}"));
             }
         }
@@ -1948,6 +2063,80 @@ impl Driver {
             "optimize" => assert_sometimes!(o == Outcome::Visible, "an OPTIMIZE (bucket change) starts while loads run", &d),
             "sort_key" => assert_sometimes!(o == Outcome::Visible, "a sort key change starts while loads run", &d),
             _ => assert_sometimes!(o == Outcome::Visible, "a manual compaction is accepted while loads run", &d),
+        }
+    }
+
+    // ----- query correctness over static data (qc.rs) --------------------------
+
+    fn draw_pred(tc: &TestCase, depth: u32) -> qc::Pred {
+        use qc::{Col, Op, Pred};
+        let cols = vec![Col::Id, Col::A, Col::B, Col::C, Col::D, Col::E];
+        let max_kind = if depth == 0 { 5 } else { 8 };
+        let lit = |tc: &TestCase, c: Col| {
+            qc::lit_for(c, tc.draw(gs::integers::<i64>()), tc.draw(gs::integers::<usize>().max_value(7)))
+        };
+        match tc.draw(gs::integers::<u32>().max_value(max_kind)) {
+            0 | 1 => {
+                let c = tc.draw(gs::sampled_from(cols));
+                let op = tc.draw(gs::sampled_from(vec![Op::Eq, Op::Ne, Op::Lt, Op::Le, Op::Gt, Op::Ge]));
+                Pred::Cmp(c, op, lit(tc, c))
+            }
+            2 => Pred::IsNull(tc.draw(gs::sampled_from(cols)), tc.draw(gs::booleans())),
+            3 => {
+                let c = tc.draw(gs::sampled_from(cols));
+                let n = tc.draw(gs::integers::<usize>().min_value(1).max_value(4));
+                Pred::In(c, (0..n).map(|_| lit(tc, c)).collect())
+            }
+            4 => {
+                let c = tc.draw(gs::sampled_from(cols));
+                Pred::Between(c, lit(tc, c), lit(tc, c))
+            }
+            5 => Pred::LikePrefix(tc.draw(gs::sampled_from(vec!["a", "ab", "b", "g", "de", ""]))),
+            6 => Pred::Not(Box::new(Self::draw_pred(tc, depth - 1))),
+            7 => Pred::And(Box::new(Self::draw_pred(tc, depth - 1)), Box::new(Self::draw_pred(tc, depth - 1))),
+            _ => Pred::Or(Box::new(Self::draw_pred(tc, depth - 1)), Box::new(Self::draw_pred(tc, depth - 1))),
+        }
+    }
+
+    fn qc_check(&self, tc: &TestCase) {
+        let p = Self::draw_pred(tc, 3);
+        let vmin = tc.draw(gs::integers::<i64>().min_value(-1_200_000).max_value(1_200_000));
+        let case = match tc.draw(gs::integers::<u32>().max_value(5)) {
+            0 => qc::agg_case(&self.qc_data, &p),
+            1 => qc::group_case(&self.qc_data, &p),
+            2 => qc::join_case(&self.qc_data, &p, vmin),
+            3 => qc::left_join_case(&self.qc_data, &p, vmin),
+            4 => qc::in_subquery_case(&self.qc_data, &p, vmin, false),
+            _ => qc::in_subquery_case(&self.qc_data, &p, vmin, true),
+        };
+        let mut settings = vec![];
+        for (name, values) in qc::SETTINGS {
+            if tc.draw(gs::weighted_booleans(0.2)) {
+                let v = tc.draw(gs::sampled_from(values.to_vec()));
+                settings.push(format!("SET {name} = {v}"));
+            }
+        }
+        match qc_query(&self.cl, &settings, &case.sql) {
+            Err(e) if e.starts_with("SET failed") => {
+                self.count("qc:set_failed");
+                log(format!("qc {}", trunc(&e)));
+            }
+            Err(e) => {
+                self.count("qc:error");
+                tc.note(&format!("qc query failed: {e}"));
+            }
+            Ok(got) => {
+                self.count(format!("qc:{}", case.kind));
+                let r = case.check(&got);
+                if let Err(why) = &r {
+                    log(format!("qc WRONG RESULT [{}] {} | settings {:?} | {}", case.kind, case.sql, settings, trunc(why)));
+                }
+                let d = json!({"kind": case.kind, "sql": case.sql, "settings": settings,
+                    "mismatch": r.as_ref().err().map(|e| trunc(e))});
+                assert_always!(r.is_ok(), "qc: a query over static data returns the right answer", &d);
+                assert_sometimes!(r.is_ok() && !settings.is_empty(),
+                    "qc: a query with non-default execution settings returns", &d);
+            }
         }
     }
 
@@ -2052,6 +2241,11 @@ impl Driver {
     #[rule(weight = 2.0)]
     fn rule_pt_read(&self, tc: TestCase) {
         self.act(|| self.pt_read(&tc));
+    }
+
+    #[rule(weight = 3.0)]
+    fn rule_qc_check(&self, tc: TestCase) {
+        self.act(|| self.qc_check(&tc));
     }
 
     #[rule(weight = 1.0)]

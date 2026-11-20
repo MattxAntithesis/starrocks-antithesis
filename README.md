@@ -6,7 +6,7 @@ cut the network, paused processes, skewed clocks and varied CPU speed.
 
 ## What it found
 
-All four bugs were found in the official 4.1.7 release images.
+All five bugs were found in the official 4.1.7 release images.
 
 | | Bug | Impact | Status | Known upstream? |
 | --- | --- | --- | --- | --- |
@@ -14,6 +14,7 @@ All four bugs were found in the official 4.1.7 release images.
 | 2 | **All three storage servers crash at once** | Storage outage | Root cause found and reproduced outside Antithesis | Yes: fixed after 4.1.7 (#82219, #82329) |
 | 3 | **One query sees a transaction half-applied** | Inconsistent results, which can be stored | Root cause found and reproduced outside Antithesis | No report or fix found for the core cause |
 | 4 | **A compute node crashes while shutting down** | Crash on restart, in-flight publishes fail | Root cause found; reproduced outside Antithesis with a debugger widening the race | No report or fix found |
+| 5 | **`OPTIMIZE` deletes a row the database just confirmed** | Silent data loss | Root cause found; reproduced outside Antithesis with a debugger widening the race | Yes: fixed after 4.1.7 (#77754), not yet released |
 
 **1. A retried load is saved twice.** StarRocks promises that resending a load
 under the same label is safe: the duplicate is rejected, for up to 3 days. In
@@ -46,17 +47,27 @@ node while it has publish work queued can segfault it. A cancelled task signals
 the lock before it is released. Rare, and reproduced with a debugger holding the
 window open. Script: [`repro/cn_shutdown_publish.sh`](repro/cn_shutdown_publish.sh).
 
+**5. `OPTIMIZE` deletes a row the database just confirmed.** An `INSERT` acknowledged OK in the
+last few milliseconds before an `ALTER TABLE ... OPTIMIZE` finishes can be lost, with the load
+still recorded as successful. Before swapping in the rewritten partition, `OPTIMIZE` checks for
+new data, but only data that is fully published. A load that has committed but not yet published
+slips past, and the swap deletes it. No fault needed. Reproduced outside Antithesis with a
+debugger holding the load at that point: 3 of 3 lost the row
+([`repro/optimize_loss_jdb.sh`](repro/optimize_loss_jdb.sh)). Another user reported it
+([#80731](https://github.com/StarRocks/starrocks/issues/80731)) and StarRocks fixed it after 4.1.7
+([#77754](https://github.com/StarRocks/starrocks/pull/77754)); no 4.1 release has the fix yet.
+
 Details, evidence and why these needed Antithesis: [FINDINGS.md](FINDINGS.md).
 
 ## What's in this repo
 
 | File | What it is |
 | --- | --- |
-| [FINDINGS.md](FINDINGS.md) | All four bugs, the evidence, and why ordinary testing missed them |
+| [FINDINGS.md](FINDINGS.md) | All five bugs, the evidence, and why ordinary testing missed them |
 | [REPORT-label-dedup.md](REPORT-label-dedup.md) | Bug 1 written up for StarRocks engineers: causal chain, code walk, reproduction steps |
 | [BUG-HISTORY.md](BUG-HISTORY.md) | How we chose what to test: 338 past StarRocks bug fixes, ranked by how often they were backported |
 | [`loads/`](loads/README.md) | The test workload: deployment, driver, and every property it checks |
-| [`repro/`](repro/) | Standalone reproductions of all four bugs: no Antithesis, no faults |
+| [`repro/`](repro/) | Standalone reproductions of all five bugs: no Antithesis, no faults |
 
 ## The workload
 
@@ -67,8 +78,12 @@ primary-key upserts, partial column updates, schema changes and retries under
 the same label. It also covers partitions being overwritten and truncated under
 load, table rewrites (`OPTIMIZE`, sort-key changes, compaction) during loads, an
 async materialized view, and the query-cache and short-circuit read paths. It runs
-on three deployments: a single FE, three FEs with leader failover, and shared-data
-mode on S3 storage.
+on four deployments: a single FE, three FEs with leader failover, shared-data mode
+on S3 storage, and shared-data with three FEs.
+
+It also checks query answers: random filters, aggregates and joins over fixed tables,
+each compared with an answer the driver computes itself, under randomized session
+settings.
 
 It also checks something a normal client can't: that replicas of a tablet agree
 on their row count. It reads them directly through
@@ -93,9 +108,11 @@ To change the StarRocks version, edit `loads/config/.env`.
 
 ## Caveats
 
-- **Only the FE was instrumented.** The C++ BE runs from the stock image, so
-  Antithesis gets no coverage feedback or thread pausing inside the storage
-  engine. An instrumented BE build would be the biggest single improvement.
+- **The instrumented BE is optional.** Runs before Finding 5 used the stock BE, so
+  Antithesis had no coverage feedback or thread pausing inside the storage engine.
+  [`loads/be/instrumented-build/`](loads/be/instrumented-build/) builds an
+  instrumented `starrocks_be`; uncomment `BE_IMAGE`/`BE_DOCKERFILE` in a config's `.env`
+  to use it. The binary is too large for git, so it isn't included.
 - **One FE patch, for startup only.** The FE won't start when the filesystem
   reports under 5 GB, which Antithesis containers do. `loads/fe/patch_je_free_disk.py`
   lowers bdb-je's `je.freeDisk` default; StarRocks `main` already exposes this as

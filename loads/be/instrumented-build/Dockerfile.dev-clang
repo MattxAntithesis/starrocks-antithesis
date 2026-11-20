@@ -1,0 +1,8 @@
+# StarRocks 4.1.7 dev-env plus Clang 18, for building an Antithesis-instrumented BE
+# (Antithesis C/C++ coverage needs clang >= 13; the dev-env image ships only GCC 14).
+FROM starrocks/dev-env-ubuntu:4.1.7
+RUN apt-get update -y && apt-get install -y --no-install-recommends wget gnupg ca-certificates \
+ && wget -qO /etc/apt/trusted.gpg.d/apt.llvm.org.asc https://apt.llvm.org/llvm-snapshot.gpg.key \
+ && echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-18 main" > /etc/apt/sources.list.d/llvm18.list \
+ && apt-get update -y && apt-get install -y --no-install-recommends clang-18 lld-18 llvm-18 \
+ && rm -rf /var/lib/apt/lists/*

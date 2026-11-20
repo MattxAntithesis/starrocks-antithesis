@@ -1,0 +1,21 @@
+# StarRocks BE for the Antithesis "loads" workload, with an Antithesis-instrumented
+# starrocks_be (coverage via -fsanitize-coverage=trace-pc-guard,pc-table, Clang 18,
+# built from the 4.1.7 tag by antithesis-build/build-be.sh). Everything else is the
+# official release image, as in be/Dockerfile. Antithesis symbolizes the binary
+# from /symbols (it carries its own DWARF, built with -g).
+ARG STARROCKS_VERSION=4.1.7
+FROM starrocks/be-ubuntu:${STARROCKS_VERSION}
+USER root
+RUN apt-get update -y && apt-get install -y --no-install-recommends jq && rm -rf /var/lib/apt/lists/*
+COPY be/be.conf.append /tmp/be.conf.append
+RUN cat /tmp/be.conf.append >> /opt/starrocks/be/conf/be.conf && \
+    cat /tmp/be.conf.append >> /opt/starrocks/be/conf/cn.conf && rm /tmp/be.conf.append
+# The build splits DWARF into starrocks_be.debuginfo (linked via .gnu_debuglink);
+# Antithesis takes the binary plus its debug file from /symbols.
+COPY be/instrumented/starrocks_be be/instrumented/starrocks_be.debuginfo /opt/starrocks/be/lib/
+RUN chmod 755 /opt/starrocks/be/lib/starrocks_be && mkdir -p /symbols && \
+    ln -s /opt/starrocks/be/lib/starrocks_be /symbols/starrocks_be && \
+    ln -s /opt/starrocks/be/lib/starrocks_be.debuginfo /symbols/starrocks_be.debuginfo
+COPY be/entrypoint.sh /entrypoint.sh
+RUN chmod 755 /entrypoint.sh
+ENTRYPOINT ["/entrypoint.sh"]

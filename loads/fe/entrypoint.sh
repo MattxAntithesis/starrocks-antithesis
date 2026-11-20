@@ -23,6 +23,10 @@ fi
 if [ "${FE_RUN_MODE:-}" = shared_data ] && ! grep -q "^run_mode = shared_data" /opt/starrocks/fe/conf/fe.conf; then
   printf '\nrun_mode = shared_data\ncloud_native_storage_type = S3\n' >> /opt/starrocks/fe/conf/fe.conf
 fi
+# FE_EXTRA_CONF: extra fe.conf lines (newline-separated), appended once.
+if [ -n "${FE_EXTRA_CONF:-}" ] && ! grep -q "^# --- FE_EXTRA_CONF ---" /opt/starrocks/fe/conf/fe.conf; then
+  printf '\n# --- FE_EXTRA_CONF ---\n%s\n' "$FE_EXTRA_CONF" >> /opt/starrocks/fe/conf/fe.conf
+fi
 # A follower (FE_HELPER=<leader>:9010) joins through the leader on its first
 # start only; once it has metadata it restarts like any FE, and finds the
 # current leader itself. The leader must list it before it may join, and the

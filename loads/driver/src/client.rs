@@ -78,9 +78,15 @@ impl Cluster {
         // A follower FE may serve reads from metadata up to
         // meta_delay_toleration_second (300 s) old, by design, so checks that
         // a read reflects acknowledged writes only hold through the leader.
-        // DRIVER_FORWARD_TO_LEADER=on makes every statement go there.
+        // DRIVER_FORWARD_TO_LEADER=on makes every statement go there. In 4.1.7
+        // `forward_to_leader` alone does not cover SELECTs (StmtExecutor
+        // initForwardToLeaderState consults only follower_query_forward_mode
+        // for queries), so set both.
         if std::env::var("DRIVER_FORWARD_TO_LEADER").as_deref() == Ok("on") {
-            o = o.init(vec!["SET forward_to_leader = true"]);
+            o = o.init(vec![
+                "SET forward_to_leader = true",
+                "SET follower_query_forward_mode = 'leader'",
+            ]);
         }
         Conn::new(o).map_err(|e| format!("connect {host}: {e}"))
     }

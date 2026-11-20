@@ -49,7 +49,7 @@ About 1 read in 440 returns different counts (5 of 2,205 in one 90-second run, f
 3. Each scan reads `getVisibleVersion()` later, with no lock held ([OlapScanNode.java#L637](https://github.com/StarRocks/starrocks/blob/b81ff9cc465a5f2e5e53104d87a59b349808abd9/fe/fe-core/src/main/java/com/starrocks/planner/OlapScanNode.java#L637)). A commit between the scan of `a` and the scan of `b` gives them different versions.
 4. The post-plan check only looks at schema changes, not data commits ([OptimisticVersion.java#L38-L41](https://github.com/StarRocks/starrocks/blob/b81ff9cc465a5f2e5e53104d87a59b349808abd9/fe/fe-core/src/main/java/com/starrocks/sql/OptimisticVersion.java#L38-L41)).
 
-Tracing the versions on a live FE confirmed the order:
+Tracing the versions on a live frontend (FE) confirmed the order: the query read table `a` at version 5, then transaction 4245 moved both tables to version 6, then the query read table `b` at version 6.
 
 ```
 READV  query 3bc1  table=a  version=5

@@ -6,7 +6,7 @@ cut the network, paused processes, skewed clocks and varied CPU speed.
 
 ## What it found
 
-All five bugs were found in the official 4.1.7 release images.
+All six bugs were found in the official 4.1.7 release images.
 
 | | Bug | Impact | Status | Known upstream? |
 | --- | --- | --- | --- | --- |
@@ -15,6 +15,7 @@ All five bugs were found in the official 4.1.7 release images.
 | 3 | **One query sees a transaction half-applied** | Inconsistent results, which can be stored | Root cause found and reproduced outside Antithesis | No report or fix found for the core cause |
 | 4 | **A compute node crashes while shutting down** | Crash on restart, in-flight publishes fail | Root cause found; reproduced outside Antithesis with a debugger widening the race | No report or fix found |
 | 5 | **`OPTIMIZE` deletes a row the database just confirmed** | Silent data loss | Root cause found; reproduced outside Antithesis with a debugger widening the race | Yes: fixed after 4.1.7 (#77754), not yet released |
+| 6 | **An "only if newer" update overwrites newer data** | Silent stale overwrites | Root cause found and reproduced outside Antithesis | Yes: fixed after 4.1.7 (#82370), not yet released |
 
 **1. A retried load is saved twice.** StarRocks promises that resending a load
 under the same label is safe: the duplicate is rejected, for up to 3 days. In
@@ -57,17 +58,26 @@ debugger holding the load at that point: 3 of 3 lost the row
 ([#80731](https://github.com/StarRocks/starrocks/issues/80731)) and StarRocks fixed it after 4.1.7
 ([#77754](https://github.com/StarRocks/starrocks/pull/77754)); no 4.1 release has the fix yet.
 
+**6. An "only if newer" update overwrites newer data.** A load can carry a merge condition so it
+applies only when its version is at least the stored one. On standard (shared-nothing) tables,
+4.1.7 accepts such a load in column-mode partial-update form, which the docs say fails, and
+applies it unconditionally: an update carrying version 5 replaced a row at version 10, 3 of 3
+times, while the same update in row mode was correctly ignored
+([`repro/column_merge.sh`](repro/column_merge.sh)). Found by checking an Antithesis run's
+behaviour against the docs. StarRocks fixed it after 4.1.7
+([#82370](https://github.com/StarRocks/starrocks/pull/82370)); no 4.1 release has the fix yet.
+
 Details, evidence and why these needed Antithesis: [FINDINGS.md](FINDINGS.md).
 
 ## What's in this repo
 
 | File | What it is |
 | --- | --- |
-| [FINDINGS.md](FINDINGS.md) | All five bugs, the evidence, and why ordinary testing missed them |
+| [FINDINGS.md](FINDINGS.md) | All six bugs, the evidence, and why ordinary testing missed them |
 | [REPORT-label-dedup.md](REPORT-label-dedup.md) | Bug 1 written up for StarRocks engineers: causal chain, code walk, reproduction steps |
 | [BUG-HISTORY.md](BUG-HISTORY.md) | How we chose what to test: 338 past StarRocks bug fixes, ranked by how often they were backported |
 | [`loads/`](loads/README.md) | The test workload: deployment, driver, and every property it checks |
-| [`repro/`](repro/) | Standalone reproductions of all five bugs: no Antithesis, no faults |
+| [`repro/`](repro/) | Standalone reproductions of all six bugs: no Antithesis, no faults |
 
 ## The workload
 

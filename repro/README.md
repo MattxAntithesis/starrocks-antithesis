@@ -18,6 +18,7 @@ cd loads/config && docker compose build
 | `cn_shutdown_publish.sh` (+ `_setup`, `_load`) | 4 | Shared-data CN stopped with publish work queued. `GDB=1` (needs a gdb image as `CN_IMAGE`, see `debug/Dockerfile.be-gdb`) widens the race with `debug/l6_widen.gdb` and crashes 5/5; `L6_ADDR=0x10e7a6d9` is the control |
 | `optimize_loss_jdb.sh` | 5 | Holds one `INSERT` between commit and publish (jdb, publish thread only) while an `OPTIMIZE` swaps its partition: the INSERT returns OK and the row is gone, 3/3. `CONTROL=1` is the same hold without `OPTIMIZE`. The breakpoint line is specific to 4.1.7 |
 | `optimize_loss.sh` | 5 | The same race with no debugger: writers insert while `OPTIMIZE` changes the bucket count, then every acknowledged id is checked. 0 lost in about 24,000 inserts; the window is a few milliseconds |
+| `column_merge.sh` | 6 | A column-mode partial update with `merge_condition` on a shared-nothing primary-key table: an older update (ver 5) overwrites a newer row (ver 10) and reports Success. Row mode, run alongside, is the control |
 
 Debugging aids for Finding 2, in `debug/`:
 

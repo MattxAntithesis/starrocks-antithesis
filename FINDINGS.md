@@ -1,11 +1,12 @@
 # Findings: StarRocks 4.1.7
 
-We found five bugs in StarRocks 4.1.7, all against the official release images
+We found six bugs in StarRocks 4.1.7, all against the official release images
 (`starrocks/{fe,be}-ubuntu:4.1.7`, build `b81ff9c`). Findings 1 and 2 came from one 90-minute
 Antithesis run (`c7d09923c0006169e56a8e0b37ee9c3a-67-0`). Finding 3 came from a later run that
 added partition, table-rebuild and multi-table read checks (`05d22732e178b35d79c3fab4f7bc4287-67-0`).
 Finding 4 came from a shared-data run (`6efc9d648a0c3c0bf66fc45cc9a085f7-67-6`). Finding 5 came
-from the first run with an Antithesis-instrumented BE (`49b70483ef11574867ea0dbfe3415d47-67-6`).
+from the first run with an Antithesis-instrumented BE (`49b70483ef11574867ea0dbfe3415d47-67-6`), and
+Finding 6 from that same run together with a review of our checks against the StarRocks docs.
 
 | # | What goes wrong | Impact | How solid | Known upstream? |
 | --- | --- | --- | --- | --- |
@@ -14,6 +15,7 @@ from the first run with an Antithesis-instrumented BE (`49b70483ef11574867ea0dbf
 | 3 | One query sees a transaction half-applied | Inconsistent results, which can be stored | Root cause found and reproduced outside Antithesis | No report or fix found for the core cause |
 | 4 | A compute node crashes while shutting down | Crash on restart, in-flight publishes fail | Root cause found; reproduced outside Antithesis with a debugger widening the race | No report or fix found |
 | 5 | `OPTIMIZE` deletes a row the database just confirmed | Silent data loss | Root cause found; reproduced outside Antithesis with a debugger widening the race | Yes: reported in #80731, fixed after 4.1.7 in #77754, not yet in a release |
+| 6 | An "only if newer" update overwrites newer data | Silent stale overwrites | Root cause found and reproduced outside Antithesis | Yes: fixed after 4.1.7 in #82370, not yet in a release |
 
 ---
 
@@ -369,9 +371,64 @@ out the cause from the run and the 4.1.7 source before finding the fix; its desc
 
 ---
 
+## Finding 6: an "only if newer" update can overwrite newer data with older data
+
+**In one line:** on a standard (shared-nothing) primary-key table, a column-mode partial update
+with a merge condition is accepted and applied unconditionally, so an older row overwrites a
+newer one. The load reports `Success`.
+
+**Why it matters.** A merge condition (`merge_condition`) is how a pipeline makes updates "apply
+only if newer": the update is applied only when its value in the condition column (a version or
+timestamp) is greater than or equal to the stored one. It protects fresh data from late, replayed
+or out-of-order updates. StarRocks documents that column-mode partial updates can't be combined
+with it on shared-nothing tables: "In shared-nothing clusters, partial updates in column mode
+cannot be used with conditional updates, and such a load fails"
+(`docs/en/loading/Load_to_Primary_Key_tables.md`). In 4.1.7 the load doesn't fail. It succeeds and
+ignores the condition.
+
+**Reproduced outside Antithesis, no debugger.** [`repro/column_merge.sh`](repro/column_merge.sh)
+starts a 1-FE/3-BE cluster on the stock 4.1.7 images. Table `t (k, v, s, ver)`, both rows at
+`v = 100, ver = 10`. Two partial updates of `k, v, ver`, each carrying the older `ver = 5`, with
+`merge_condition: ver`:
+
+```
+before:                       1 100 orig 10; 2 100 orig 10
+row mode,    key 1, ver 5:    Success
+column mode, key 2, ver 5:    Success
+after:                        1 100 orig 10; 2 6 orig 5     <- key 2 went back to ver 5
+```
+
+3 of 3 runs, identical. Row mode (the control) correctly ignores the older update every time.
+The update must leave at least one column out (`s` here); an update of every column takes the
+full-row path, which applies the condition correctly.
+
+**Cause** (4.1.7 source). No check rejects the combination: the FE's `Load.checkMergeCondition`
+doesn't look at the partial-update mode, and neither does the BE's `DeltaWriter`. The BE then
+applies a column-mode rowset with `TabletUpdates::_apply_column_partial_update_commit`, which,
+like the `RowsetColumnUpdateState` behind it, never reads the merge condition. Only the row-mode
+path (`_apply_normal_rowset_commit`) does. Shared-data tables have their own column-mode handler
+that does evaluate the condition (supported there from v4.1.1).
+
+**How it was found.** An Antithesis run logged column-mode loads with a merge condition
+succeeding on a shared-nothing cluster. Our review of the workload's checks against the StarRocks
+documentation then flagged that, per the docs, those loads should have failed. A direct test
+showed what they actually did. Our own data check couldn't catch it: it treats any conditional
+update as "either value is acceptable".
+
+**Impact.** Silent overwrites of newer data with older data, for anyone combining column-mode
+partial updates with a merge condition on shared-nothing tables. No error, and the stale row
+looks like any other.
+
+**Already fixed upstream, after 4.1.7.** StarRocks fixed it on 2026-11-05 in
+[#82370](https://github.com/StarRocks/starrocks/pull/82370) ("Reject column-mode partial update with
+merge_condition on shared-nothing tables"), backported to the 4.1 branch. The BE now refuses the
+load before writing any data. 4.1.7 (2026-11-03) doesn't have it, and no 4.1 release does yet.
+
+---
+
 ## Why these bugs needed Antithesis
 
-All five bugs are in code StarRocks already tests heavily. Here is why ordinary methods
+All six bugs are in code StarRocks already tests heavily. Here is why ordinary methods
 missed them, and what was different here.
 
 **1. The duplicate-data bug is invisible to normal testing.** No error, no crash and no
@@ -415,7 +472,7 @@ seconds after the load, and connect it straight to the line of code responsible.
 
 **Replaying a moment with changes.** Any moment of a run can be reopened and run forward
 differently, for example without a fault or without a concurrent operation. That is the tool
-for bugs that won't reproduce outside the simulator. All five here did reproduce outside it (two
+for bugs that won't reproduce outside the simulator. All six here did reproduce outside it (two
 with a debugger holding the race open),
 so the standalone scripts in [`repro/`](repro/) are the evidence.
 
@@ -423,7 +480,8 @@ so the standalone scripts in [`repro/`](repro/) are the evidence.
 
 ## Limits of this testing
 
-- **The BE was instrumented only from Finding 5's run on.** Earlier runs used the stock BE, so
+- **The FE's own code was instrumented in every run** (all FE JARs; Antithesis lists them under the
+  name of the one with a `Main-Class`, the bdb-je library). **The BE was instrumented only from Finding 5's run on.** Earlier runs used the stock BE, so
   Antithesis had no coverage feedback or thread pausing inside the storage engine. The
   instrumented build ([`loads/be/instrumented-build/`](loads/be/instrumented-build/)) gives it
   about 4.7 million coverage points in `starrocks_be`.
